@@ -25,7 +25,7 @@ setup(
     license='MIT',
     entry_points={
         'console_scripts': [
-            #  Nodi ROS
+            'door_controller = escape_room.nodes.door_controller:main',
         ],
     },
 )

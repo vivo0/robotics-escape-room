@@ -32,25 +32,96 @@ def make_shape(sim, prim_type, size, position, color=(0.7, 0.7, 0.7),
     return handle
 
 
-def build_walls(sim, prim, width, depth, height, thickness):
+def _segments_around_gap(length, gap_w, gap_offset):
+    """Wall segments around a centered gap. Returns [(seg_length, seg_center), ...]."""
+    half = length / 2
+    gap_l = gap_offset - gap_w / 2
+    gap_r = gap_offset + gap_w / 2
+    segments = []
+    if gap_l > -half:
+        segments.append((gap_l - (-half), (-half + gap_l) / 2))
+    if gap_r < half:
+        segments.append((half - gap_r, (gap_r + half) / 2))
+    return segments
+
+
+def build_walls(sim, prim, width, depth, height, thickness, door_cfg=None):
     hw, hd = width / 2, depth / 2
-    walls = [
-        ((width + 2*thickness, thickness, height),
-         (0,  hd + thickness/2, height/2), 'WallNorth'),
-        ((width + 2*thickness, thickness, height),
-         (0, -hd - thickness/2, height/2), 'WallSouth'),
-        ((thickness, depth, height),
-         ( hw + thickness/2, 0, height/2), 'WallEast'),
-        ((thickness, depth, height),
-         (-hw - thickness/2, 0, height/2), 'WallWest'),
-    ]
+    walls = {
+        'north': dict(axis='x', length=width + 2*thickness,
+                      center=(0,  hd + thickness/2, height/2), name='WallNorth'),
+        'south': dict(axis='x', length=width + 2*thickness,
+                      center=(0, -hd - thickness/2, height/2), name='WallSouth'),
+        'east':  dict(axis='y', length=depth,
+                      center=( hw + thickness/2, 0, height/2), name='WallEast'),
+        'west':  dict(axis='y', length=depth,
+                      center=(-hw - thickness/2, 0, height/2), name='WallWest'),
+    }
+
+    door_side = door_cfg['wall'] if door_cfg else None
+    door_w = door_cfg['width'] if door_cfg else 0.0
+    door_off = door_cfg.get('offset', 0.0) if door_cfg else 0.0
+
     handles = []
-    for size, pos, name in walls:
-        h = make_shape(sim, prim['box'], size, pos,
-                       color=(0.85, 0.85, 0.85), name=name)
-        sim.setObjectSpecialProperty(h, sim.objectspecialproperty_detectable_all)
-        handles.append(h)
+    for side, w in walls.items():
+        if side == door_side:
+            for i, (seg_len, seg_ctr) in enumerate(
+                    _segments_around_gap(w['length'], door_w, door_off)):
+                if w['axis'] == 'x':
+                    size = (seg_len, thickness, height)
+                    pos = (w['center'][0] + seg_ctr, w['center'][1], w['center'][2])
+                else:
+                    size = (thickness, seg_len, height)
+                    pos = (w['center'][0], w['center'][1] + seg_ctr, w['center'][2])
+                h = make_shape(sim, prim['box'], size, pos,
+                               color=(0.85, 0.85, 0.85),
+                               name=f"{w['name']}_{i}")
+                sim.setObjectSpecialProperty(h, sim.objectspecialproperty_detectable_all)
+                handles.append(h)
+        else:
+            if w['axis'] == 'x':
+                size = (w['length'], thickness, height)
+            else:
+                size = (thickness, w['length'], height)
+            h = make_shape(sim, prim['box'], size, w['center'],
+                           color=(0.85, 0.85, 0.85), name=w['name'])
+            sim.setObjectSpecialProperty(h, sim.objectspecialproperty_detectable_all)
+            handles.append(h)
     return handles
+
+
+def build_door(sim, prim, room, door_cfg):
+    """Place a Door box that fills the gap left in one of the room walls."""
+    width, depth = room['size'][0], room['size'][1]
+    thickness = room['wall_thickness']
+    height = room['wall_height']
+    hw, hd = width / 2, depth / 2
+
+    side = door_cfg['wall']
+    door_w = door_cfg['width']
+    offset = door_cfg.get('offset', 0.0)
+    color = door_cfg.get('color', (0.55, 0.30, 0.15))
+
+    if side == 'north':
+        size = (door_w, thickness, height)
+        pos = (offset,  hd + thickness/2, height/2)
+    elif side == 'south':
+        size = (door_w, thickness, height)
+        pos = (offset, -hd - thickness/2, height/2)
+    elif side == 'east':
+        size = (thickness, door_w, height)
+        pos = ( hw + thickness/2, offset, height/2)
+    elif side == 'west':
+        size = (thickness, door_w, height)
+        pos = (-hw - thickness/2, offset, height/2)
+    else:
+        raise ValueError(f"Unknown door wall: {side}")
+
+    h = make_shape(sim, prim['box'], size, pos,
+                   color=color, name='Door',
+                   static=True, respondable=True)
+    sim.setObjectSpecialProperty(h, sim.objectspecialproperty_detectable_all)
+    return h
 
 
 def build_obstacle(sim, prim, obs, idx):
@@ -136,7 +207,7 @@ def clear_scene(sim):
     cameras, lights) untouched.
     """
     managed_prefixes = (
-        'Wall', 'Obstacle_', 'TargetCube', 'PressurePlate',
+        'Wall', 'Obstacle_', 'TargetCube', 'PressurePlate', 'Door',
         'RoboMasterEP', 'RoboMasterS1',
     )
     handles_to_remove = []
@@ -179,11 +250,17 @@ def main(scenario_path: str):
 
     print("[builder] Building walls...")
     room = cfg['room']
+    door_cfg = cfg.get('door')
     build_walls(sim, prim,
                 width=room['size'][0],
                 depth=room['size'][1],
                 height=room['wall_height'],
-                thickness=room['wall_thickness'])
+                thickness=room['wall_thickness'],
+                door_cfg=door_cfg)
+
+    if door_cfg is not None:
+        print(f"[builder] Placing door on {door_cfg['wall']} wall...")
+        build_door(sim, prim, room, door_cfg)
 
     print(f"[builder] Building {len(cfg.get('obstacles', []))} obstacles...")
     for i, obs in enumerate(cfg.get('obstacles', [])):
