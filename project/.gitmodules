@@ -1,0 +1,15 @@
+[submodule "src/robomaster_sim"]
+	path = src/robomaster_sim
+	url = git@github.com:jeguzzi/robomaster_sim.git
+	branch = "main"
+
+[submodule "src/robomaster_ros"]
+	path = src/robomaster_ros
+	url = git@github.com:EliaCereda/robomaster_ros.git
+	branch = "main"
+
+[submodule "src/simExtROS2"]
+	path = src/simExtROS2
+	url = git@github.com:EliaCereda/simExtROS2.git
+	branch = "iron-4.6"
+

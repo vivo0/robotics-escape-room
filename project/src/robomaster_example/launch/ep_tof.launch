@@ -1,0 +1,27 @@
+<launch>
+  <include file="$(find-pkg-share robomaster_ros)/launch/main.launch">
+    <arg name="model" value="ep"/>
+    <arg name="name" value="rm0"/>
+
+    <!-- TOF sensor configurations -->
+    <arg name="tof_0" value="true"/>
+    <arg name="tof_0_parent" value="base_link"/>
+    <arg name="tof_0_xyz" value="-0.10703 -0.0996 0.13077"/>
+    <arg name="tof_0_rpy" value="0 0 -2.79253"/>
+
+    <arg name="tof_1" value="true"/>
+    <arg name="tof_1_parent" value="base_link"/>
+    <arg name="tof_1_xyz" value="0.10297 -0.0996 0.13077"/>
+    <arg name="tof_1_rpy" value="0 0 -0.34907"/>
+
+    <arg name="tof_2" value="true"/>
+    <arg name="tof_2_parent" value="base_link"/>
+    <arg name="tof_2_xyz" value="-0.10703 0.0996 0.13077"/>
+    <arg name="tof_2_rpy" value="0 0 2.79253"/>
+
+    <arg name="tof_3" value="true"/>
+    <arg name="tof_3_parent" value="base_link"/>
+    <arg name="tof_3_xyz" value="0.10297 0.0996 0.13077"/>
+    <arg name="tof_3_rpy" value="0 0 0.34907"/>
+  </include>
+</launch>
