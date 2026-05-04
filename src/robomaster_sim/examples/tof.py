@@ -1,9 +1,10 @@
 # type: ignore
 
 import time
-from robomaster import robot, logger, logging, sensor  # noqa
 
-import patch_ftp # noqa
+from robomaster import logger, logging, robot, sensor  # noqa
+
+import src.robomaster_sim.examples.patch_ftp as patch_ftp  # noqa
 
 
 def data_info(self):
@@ -29,5 +30,5 @@ def main():
     ep_robot.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

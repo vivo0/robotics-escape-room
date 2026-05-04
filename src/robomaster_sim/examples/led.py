@@ -1,12 +1,12 @@
 # type: ignore
 
 import time
-import patch_ftp
+
 import robomaster.config  # noqa
-from robomaster import robot, logger, logging, protocol, util   # noqa
 import robomaster.conn
 import robomaster.led
-from robomaster.led import EFFECT_ON, EFFECT_OFF
+from robomaster import logger, logging, protocol, robot, util  # noqa
+from robomaster.led import EFFECT_OFF, EFFECT_ON
 
 
 def main():
@@ -21,5 +21,5 @@ def main():
     ep_robot.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

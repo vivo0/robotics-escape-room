@@ -1,6 +1,6 @@
 from setuptools import setup
 
-package_name = 'robot'
+package_name = 'escape_room'
 
 setup(
     name=package_name,
