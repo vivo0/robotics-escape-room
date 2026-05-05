@@ -173,28 +173,14 @@ def build_door(sim, prim, room, door_cfg):
 
 def build_obstacle(sim, prim, obs, idx):
     color = obs.get("color", (0.4, 0.4, 0.5))
-    if obs["type"] == "box":
-        h = make_shape(
-            sim,
-            prim["box"],
-            obs["size"],
-            obs["position"],
-            color=color,
-            name=f"Obstacle_{idx}",
-        )
-    elif obs["type"] == "cylinder":
-        d = obs["radius"] * 2
-        size = [d, d, obs["height"]]
-        h = make_shape(
-            sim,
-            prim["cylinder"],
-            size,
-            obs["position"],
-            color=color,
-            name=f"Obstacle_{idx}",
-        )
-    else:
-        raise ValueError(f"Unknown obstacle type: {obs['type']}")
+    h = make_shape(
+        sim,
+        prim[obs["type"]],
+        obs["size"],
+        obs["position"],
+        color=color,
+        name=f"Obstacle_{idx}",
+    )
     sim.setObjectSpecialProperty(h, sim.objectspecialproperty_detectable_all)
     return h
 

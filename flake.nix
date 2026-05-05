@@ -1,88 +1,72 @@
 {
-  description = "A Nix-flake-based Python development environment";
+  description = "A Nix shell that automatically activates a Pixi environment";
 
-  inputs.nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0.1"; # unstable Nixpkgs
+  inputs.nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0.1";
 
   outputs =
     { self, ... }@inputs:
     let
+      inherit (inputs.nixpkgs) lib;
+
       supportedSystems = [
-        "x86_64-linux"
-        "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
+
       forEachSupportedSystem =
         f:
-        inputs.nixpkgs.lib.genAttrs supportedSystems (
+        lib.genAttrs supportedSystems (
           system:
           f {
+            inherit system;
             pkgs = import inputs.nixpkgs { inherit system; };
           }
         );
-
-      /*
-        Change this value ({major}.{min}) to
-        update the Python virtual-environment
-        version. When you do this, make sure
-        to delete the `.venv` directory to
-        have the hook rebuild it for the new
-        version, since it won't overwrite an
-        existing one. After this, reload the
-        development shell to rebuild it.
-        You'll see a warning asking you to
-        do this when version mismatches are
-        present. For safety, removal should
-        be a manual step, even if trivial.
-      */
-      version = "3.13";
     in
     {
       devShells = forEachSupportedSystem (
-        { pkgs }:
-        let
-          concatMajorMinor =
-            v:
-            pkgs.lib.pipe v [
-              pkgs.lib.versions.splitVersion
-              (pkgs.lib.sublist 0 2)
-              pkgs.lib.concatStrings
+        { pkgs, system }:
+        {
+          default = pkgs.mkShellNoCC {
+            packages = [
+              self.formatter.${system}
             ];
 
-          python = pkgs."python${concatMajorMinor version}";
-        in
-        {
-          default = pkgs.mkShell {
-            packages =
-              with pkgs;
-              [
-                pixi
-              ]
-              ++ (with python.pkgs; [
-                # python
-                # ruff
-
-                # numpy
-                # pandas
-                # matplotlib
-                # seaborn
-                # plotly
-                # scikit-learn
-
-                # pip
-                # notebook
-                # jupyter
-                # ipywidgets
-                # ipykernel
-                # debugpy
-              ]);
             shellHook = ''
-              if [ -n "$ZSH_VERSION" ]; then
-                eval "$(pixi completion --shell zsh)"
+              # 1. Load Homebrew environment so Nix can see 'pixi'
+              if [ -f /opt/homebrew/bin/brew ]; then
+                eval "$(/opt/homebrew/bin/brew shellenv)"
+              elif [ -f /usr/local/bin/brew ]; then
+                eval "$(/usr/local/bin/brew shellenv)"
+              fi
+
+              # 2. Ensure Pixi is installed and available
+              if ! command -v pixi &> /dev/null; then
+                echo "❌ Error: pixi not found. Install it via 'brew install pixi'."
+              else
+                # 3. Ensure the project environment is installed
+                pixi install --quiet
+
+                # 4. AUTOMATICALLY ACTIVATE PIXI
+                # This injects the .pixi environment variables into your current shell
+                # Effectively doing 'pixi shell' without spawning a sub-shell
+                eval "$(pixi shell-hook)"
+
+                # 5. Sanitize environment
+                unset PYTHONPATH
+                unset VIRTUAL_ENV
+
+                # 6. Optional: Setup completions
+                if [ -n "$ZSH_VERSION" ]; then
+                  eval "$(pixi completion --shell zsh)"
+                fi
+
+                echo "🤖 Pixi environment (.pixi) is active."
               fi
             '';
           };
         }
       );
+
+      formatter = forEachSupportedSystem ({ pkgs, ... }: pkgs.nixfmt);
     };
 }
