@@ -12,9 +12,12 @@
 #   3. Build the scene from the scenario JSON
 #   4. colcon build the escape_room package and re-source the workspace
 #   5. Start the simulation in CoppeliaSim
-#   6. Run the door controller in the foreground (Ctrl-C to stop)
+#   6. Launch robomaster_ros driver in the background, wait for /odom
+#   7. Launch the door controller in the background
+#   8. Run the discovery launch (mapper + TF) in the foreground (Ctrl-C to stop)
 #
-# CoppeliaSim is left running after the script exits.
+# CoppeliaSim and the background ROS processes are left running after Ctrl-C.
+# Kill them with: pkill -f robomaster_driver; pkill -f door_controller
 
 set -euo pipefail
 
@@ -77,6 +80,39 @@ if sim.getSimulationState() == sim.simulation_stopped:
     sim.startSimulation()
 PY
 
-# 6. Run the door controller in the foreground (Ctrl-C to stop)
-echo "[run] Launching door controller (Ctrl-C to stop)..."
-ros2 run escape_room door_controller
+# 6. Restart the robomaster_ros driver (the build_scene reload disconnects
+# the previous one from the simulated robot; reusing it would publish stale
+# /odom but no TF). Kill the launch process and all children, then relaunch.
+echo "[run] (Re)starting robomaster_ros driver..."
+pkill -f "ros2 launch robomaster_ros" 2>/dev/null || true
+pkill -f robomaster_driver 2>/dev/null || true
+pkill -f "robot_state_publisher" 2>/dev/null || true
+pkill -f "joint_state_publisher" 2>/dev/null || true
+sleep 1
+ros2 launch robomaster_ros ep.launch >/tmp/robomaster_ros.log 2>&1 &
+
+echo "[run] Waiting for /odom topic..."
+for i in $(seq 1 30); do
+    if ros2 topic list 2>/dev/null | grep -q '^/odom$'; then
+        echo "[run] /odom is up; giving driver 3s for TF tree to settle..."
+        sleep 3
+        break
+    fi
+    sleep 1
+    if [[ "$i" == "30" ]]; then
+        echo "[run] /odom did not appear in 30s. See /tmp/robomaster_ros.log." >&2
+        exit 1
+    fi
+done
+
+# 7. Launch the door controller in the background
+if pgrep -f "escape_room.nodes.door_controller" >/dev/null 2>&1; then
+    echo "[run] door_controller already running."
+else
+    echo "[run] Launching door_controller in background..."
+    ros2 run escape_room door_controller >/tmp/door_controller.log 2>&1 &
+fi
+
+# 8. Discovery launch in the foreground (mapper + static TF)
+echo "[run] Launching discovery (mapper + velodyne TF). Ctrl-C to stop..."
+ros2 launch escape_room discovery.launch.py

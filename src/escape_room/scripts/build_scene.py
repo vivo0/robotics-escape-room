@@ -216,10 +216,24 @@ def build_pressure_plate(sim, prim, cfg):
 
 
 def load_robot(sim, robot_cfg):
-    """Load a RoboMaster model preserving its natural pose offsets."""
+    """Load a RoboMaster model preserving its natural pose offsets.
+
+    Resolution order for the model file:
+      1. robot_cfg['model_path'] — explicit path (absolute, or relative to cwd)
+      2. <coppelia models>/robots/mobile/<robot_cfg['model']>.ttm — fallback
+    The in-scene alias is always robot_cfg['model'] so downstream code
+    (clear_scene, robomaster_ros TF chain) stays stable.
+    """
     model_name = robot_cfg.get("model", "RoboMasterEP")
-    coppelia_root = sim.getStringParam(sim.stringparam_scenedefaultdir)
-    model_path = f"{coppelia_root}/../models/robots/mobile/{model_name}.ttm"
+    explicit_path = robot_cfg.get("model_path")
+
+    if explicit_path:
+        model_path = str(Path(explicit_path).expanduser().resolve())
+        if not Path(model_path).is_file():
+            raise FileNotFoundError(f"Robot model not found: {model_path}")
+    else:
+        coppelia_root = sim.getStringParam(sim.stringparam_scenedefaultdir)
+        model_path = f"{coppelia_root}/../models/robots/mobile/{model_name}.ttm"
 
     handle = sim.loadModel(model_path)
     if handle < 0:
