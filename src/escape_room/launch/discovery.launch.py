@@ -2,13 +2,18 @@
 Discovery-phase launch:
   - static TF: chassis_base_link -> velodyne (Velodyne mount on the robot)
   - mapper_node: builds /map from /velodyne_points
+  - explorer_node: frontier-based exploration (A* + pure pursuit on /map)
 
 Tune the Velodyne mount via launch args (defaults assume sensor centered
 on top of the chassis, ~15 cm above):
     ros2 launch escape_room discovery.launch.py velodyne_z:=0.18
+
+Disable autonomous driving (mapping only) with:
+    ros2 launch escape_room discovery.launch.py explore:=false
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -27,6 +32,8 @@ def generate_launch_description():
         DeclareLaunchArgument('velodyne_parent_frame',
                               default_value='chassis_base_link'),
         DeclareLaunchArgument('velodyne_child_frame', default_value='velodyne'),
+        DeclareLaunchArgument('explore', default_value='true',
+                              description='Run explorer_node alongside the mapper'),
     ]
 
     velodyne_static_tf = Node(
@@ -53,4 +60,12 @@ def generate_launch_description():
         output='screen',
     )
 
-    return LaunchDescription(args + [velodyne_static_tf, mapper])
+    explorer = Node(
+        package='escape_room',
+        executable='explorer_node',
+        name='explorer_node',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('explore')),
+    )
+
+    return LaunchDescription(args + [velodyne_static_tf, mapper, explorer])

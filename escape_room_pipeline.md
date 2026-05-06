@@ -4,7 +4,7 @@
 
 Il robot è chiuso in una stanza con ostacoli. Deve trovare una **chiave** (cubo colorato), portarla su una **pressure plate** colorata per aprire una **porta** colorata, e uscire. Tre landmark distinti per colore, ciascuno scoperto una volta sola e poi ricordato.
 
-## Architettura a due fasi
+## Architettura a due fasi 
 
 **Fase 1 — Discovery.** Il robot esplora reattivamente, costruisce in memoria una mappa degli ostacoli, e annota la posizione dei tre landmark man mano che li vede.
 

@@ -29,6 +29,7 @@ setup(
         "console_scripts": [
             "door_controller = escape_room.nodes.door_controller:main",
             "mapper_node = escape_room.nodes.mapper_node:main",
+            "explorer_node = escape_room.nodes.explorer_node:main",
         ],
     },
 )
