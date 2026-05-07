@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
-"""
-Frontier-based exploration node.
+"""Frontier-based exploration node.
 
 Subscribes:
-    /map            (nav_msgs/OccupancyGrid, in ``world`` frame)
-    /targets/cube   (geometry_msgs/PoseStamped, latched) — red key
-    /targets/plate  (geometry_msgs/PoseStamped, latched) — pressure plate
-    /targets/door   (geometry_msgs/PoseStamped, latched) — exit door
+    /map                    (nav_msgs/OccupancyGrid)
+    /targets/{cube,plate,door}  (geometry_msgs/PoseStamped, latched)
 
 Publishes:
-    /cmd_vel               (geometry_msgs/Twist) — drive commands
-    /exploration/path      (nav_msgs/Path) — current A* plan, for RViz
+    /cmd_vel               (geometry_msgs/Twist)
+    /exploration/path      (nav_msgs/Path) — A* plan, for RViz
     /exploration/frontiers (geometry_msgs/PoseArray) — frontier centroids
 
-Pose source: CoppeliaSim ZMQ remote API. Bypasses TF, so the planner
-sees the exact robot pose at the moment of every tick.
-
-The node has two modes:
+Pose source is the CoppeliaSim ZMQ API (bypasses TF, exact pose every
+tick). The node has two modes:
 
 * ``explore`` (default) — pick frontiers, plan A* toward them.
-* ``go_to_key`` — entered as soon as all three landmark poses
-  (cube/plate/door) have been received on ``/targets/*``. The robot
-  abandons frontier exploration and drives straight toward the key.
+* ``go_to_key`` — entered as soon as all three landmark poses have
+  arrived on ``/targets/*``. Tries A* directly to the cube; if the
+  corridor still crosses UNKNOWN cells it heads to the frontier
+  closest to the cube and retries on the next replan.
 """
 from __future__ import annotations
 
@@ -47,18 +43,14 @@ from escape_room.planning.pure_pursuit import PurePursuitConfig
 
 
 def yaw_from_pose_matrix(mat12: list) -> float:
-    """Extract yaw (rotation about Z) from a CoppeliaSim 3x4 row-major
-    pose matrix (12 floats)."""
+    """Yaw from a CoppeliaSim 3x4 row-major pose matrix."""
     R = np.array(mat12, dtype=np.float64).reshape(3, 4)[:, :3]
     return math.atan2(R[1, 0], R[0, 0])
 
 
 def occupancy_msg_to_grid(msg: OccupancyGridMsg) -> OccupancyGrid:
-    """Reconstruct an OccupancyGrid from an incoming nav_msgs/OccupancyGrid.
-
-    The publisher already collapsed cell state to {-1, 0, 100}; we
-    re-encode it into our boolean ``free`` / ``occ`` masks.
-    """
+    """Rebuild an OccupancyGrid from a nav_msgs/OccupancyGrid: re-encode
+    {-1, 0, 100} into boolean ``free`` / ``occ`` masks."""
     spec = GridSpec(
         width_m=msg.info.width * msg.info.resolution,
         height_m=msg.info.height * msg.info.resolution,
@@ -71,7 +63,6 @@ def occupancy_msg_to_grid(msg: OccupancyGridMsg) -> OccupancyGrid:
         msg.info.height, msg.info.width)
     grid.free[arr == FREE] = True
     grid.occ[arr == OCCUPIED] = True
-    # arr == UNKNOWN stays at default (both False).
     return grid
 
 
@@ -102,16 +93,16 @@ class ExplorerNode(Node):
         robot_alias = str(self.get_parameter('robot_alias').value)
 
         # ---- sim connection -----------------------------------------
-        self.get_logger().info('Connecting to CoppeliaSim ZMQ remote API...')
+        # Keep the client as a member: anonymous clients can be
+        # garbage-collected, dropping the ZMQ connection.
         self.client = RemoteAPIClient()
         self.sim = self.client.require('sim')
         try:
             self.robot_handle = self.sim.getObject(robot_alias)
         except Exception as e:
             raise RuntimeError(
-                f"Could not resolve robot alias '{robot_alias}'. "
-                f"Run build_scene first. ({e})"
-            )
+                f"could not resolve robot alias '{robot_alias}'; "
+                f"run build_scene first ({e})")
 
         # ---- ROS pub/sub --------------------------------------------
         latched_qos = QoSProfile(
@@ -132,8 +123,8 @@ class ExplorerNode(Node):
         self.frontiers_pub = self.create_publisher(
             PoseArray, '/exploration/frontiers', 10)
 
-        # Latched landmark topics from color_detector_node. We need all
-        # three (cube, plate, door) before abandoning exploration.
+        # Landmark topics from color_detector_node; we need all three
+        # before abandoning exploration.
         self._target_xy: dict[str, tuple[float, float]] = {}
         self._required_targets = ('cube', 'plate', 'door')
         self._target_subs = [
@@ -160,11 +151,8 @@ class ExplorerNode(Node):
         )
 
         self.get_logger().info(
-            f'explorer_node ready. frame={self.map_frame}, '
-            f'pose source = sim direct ({robot_alias}), '
-            f'robot_radius={self.robot_radius:.2f} m, '
-            f'replan every {self.replan_period:.1f} s'
-        )
+            f'ready. robot_radius={self.robot_radius:.2f} m, '
+            f'replan every {self.replan_period:.1f} s')
 
     # ===== callbacks =====================================================
 
@@ -187,13 +175,11 @@ class ExplorerNode(Node):
                 and all(t in self._target_xy
                         for t in self._required_targets)):
             self._mode = 'go_to_key'
-            # Force an immediate replan toward the key on the next tick.
-            self._planner = None
+            self._planner = None  # force a replan toward the key
             self._goal_xy = None
             self.get_logger().info(
-                'All landmarks seen — switching to GO_TO_KEY '
-                f'(target = cube @ {self._target_xy["cube"]}).'
-            )
+                f'all landmarks seen — GO_TO_KEY '
+                f'(cube @ {self._target_xy["cube"]})')
 
     def _tick(self) -> None:
         if self._mode == 'done':
@@ -207,12 +193,10 @@ class ExplorerNode(Node):
             return
         rx, ry, ryaw = pose
 
-        # Reached the key — mission for this node is complete.
         if self._mode == 'go_to_key':
             kx, ky = self._target_xy['cube']
             if math.hypot(kx - rx, ky - ry) <= self._key_arrival_tol:
-                self.get_logger().info(
-                    'GO_TO_KEY: arrived at the key — stopping.')
+                self.get_logger().info('arrived at the key — stopping')
                 self._mode = 'done'
                 self._planner = None
                 self._publish_stop()
@@ -248,9 +232,7 @@ class ExplorerNode(Node):
         grid = self._latest_map
         if grid is None:
             return
-
-        # Inflate by robot radius (rounded up to whole cells) so A* can
-        # plan with a point robot. See OccupancyGrid.inflate.
+        # Inflate by robot radius so A* can plan with a point robot.
         inflate_cells = max(
             1, int(math.ceil(self.robot_radius / grid.spec.resolution)))
         inflated = grid.inflate(inflate_cells)
@@ -262,73 +244,99 @@ class ExplorerNode(Node):
 
     def _replan_to_key(self, grid: OccupancyGrid, inflated: OccupancyGrid,
                        rx: float, ry: float) -> None:
-        """Try a direct A* path to the cube. If the corridor between the
-        robot and the key still goes through UNKNOWN cells, A* will fail
-        (UNKNOWN counts as blocked). In that case, fall back to driving
-        toward the frontier closest to the key — that uncovers the
-        unmapped strip in the right direction, and the next replan will
-        retry the direct path."""
-        key_xy = self._target_xy.get('cube')
-        if key_xy is None:
-            return  # shouldn't happen: we only enter this mode after key seen
+        """A* directly to the cube. Falls back to the frontier nearest
+        the key when the corridor still crosses UNKNOWN (which A*
+        treats as blocked); next replan retries the direct path."""
+        key_xy = self._target_xy['cube']
 
-        # 1) Try the exact key pose, then a small free ring around it
-        # (the cube itself sits inside its own inflation footprint).
-        candidates = [key_xy] + self._nearby_free_world(inflated, key_xy)
-        for goal_xy in candidates:
+        # 1) Direct: try the key pose, then a free ring around it.
+        for goal_xy in [key_xy] + self._nearby_free_world(inflated, key_xy):
             path = plan_path(inflated, (rx, ry), goal_xy)
             if path is not None and len(path) >= 2:
-                self._planner = PurePursuit(path, PurePursuitConfig())
-                self._goal_xy = goal_xy
-                self._publish_path(path)
+                self._adopt_path(path, goal_xy)
                 self.get_logger().info(
                     f'GO_TO_KEY: direct path to ({goal_xy[0]:.2f}, '
-                    f'{goal_xy[1]:.2f})'
-                )
+                    f'{goal_xy[1]:.2f})')
                 return
 
-        # 2) No direct path yet. Drive to whichever frontier sits closest
-        # to the key so we extend the map in that direction.
+        # 2) Fall back to the closest frontier to the key.
         frontiers = find_frontiers(grid, min_size=self.frontier_min_size)
         self._publish_frontiers(frontiers)
-        scored: list[tuple[float, object]] = []
-        for f in frontiers:
-            cc, cr = inflated.world_to_grid(*f.centroid_xy)
-            if (cc, cr) in self._blacklist:
-                continue
-            if not inflated.is_traversable(cc, cr):
-                continue
-            d_to_key = math.hypot(
-                f.centroid_xy[0] - key_xy[0], f.centroid_xy[1] - key_xy[1])
-            scored.append((d_to_key, f))
-        scored.sort()  # closest-to-key first
+        scored = sorted(
+            ((math.hypot(f.centroid_xy[0] - key_xy[0],
+                         f.centroid_xy[1] - key_xy[1]), f)
+             for f in frontiers
+             if self._is_frontier_eligible(inflated, f)),
+            key=lambda x: x[0])
 
         for d_to_key, f in scored:
             path = plan_path(inflated, (rx, ry), f.centroid_xy)
             if path is None or len(path) < 2:
-                cc, cr = inflated.world_to_grid(*f.centroid_xy)
-                self._blacklist.add((cc, cr))
+                self._blacklist.add(inflated.world_to_grid(*f.centroid_xy))
                 continue
-            self._planner = PurePursuit(path, PurePursuitConfig())
-            self._goal_xy = f.centroid_xy
-            self._publish_path(path)
+            self._adopt_path(path, f.centroid_xy)
             self.get_logger().info(
-                f'GO_TO_KEY: key not reachable yet, heading to frontier '
-                f'@ ({f.centroid_xy[0]:.2f}, {f.centroid_xy[1]:.2f}) '
-                f'(d_to_key={d_to_key:.2f} m)'
-            )
+                f'GO_TO_KEY: heading to frontier @ '
+                f'({f.centroid_xy[0]:.2f}, {f.centroid_xy[1]:.2f}) '
+                f'(d_to_key={d_to_key:.2f} m)')
             return
 
         self.get_logger().warn(
-            'GO_TO_KEY: no path to the key and no reachable frontier — '
-            'is the key in an enclosed area?')
+            'GO_TO_KEY: no path to the key and no reachable frontier')
         self._planner = None
+
+    def _replan_frontier(self, grid: OccupancyGrid,
+                         inflated: OccupancyGrid,
+                         rx: float, ry: float) -> None:
+        frontiers = find_frontiers(grid, min_size=self.frontier_min_size)
+        self._publish_frontiers(frontiers)
+        if not frontiers:
+            self.get_logger().info('exploration complete')
+            self._mode = 'done'
+            self._planner = None
+            return
+
+        # Score = size / distance: prefer big nearby frontiers.
+        scored: list[tuple[float, object]] = []
+        for f in frontiers:
+            if not self._is_frontier_eligible(inflated, f):
+                continue
+            d = math.hypot(f.centroid_xy[0] - rx, f.centroid_xy[1] - ry)
+            if d < 1e-3:
+                continue
+            scored.append((f.size / d, f))
+        scored.sort(reverse=True)
+
+        for score, f in scored:
+            path = plan_path(inflated, (rx, ry), f.centroid_xy)
+            if path is None or len(path) < 2:
+                self._blacklist.add(inflated.world_to_grid(*f.centroid_xy))
+                continue
+            self._adopt_path(path, f.centroid_xy)
+            self.get_logger().info(
+                f'heading to frontier @ ({f.centroid_xy[0]:.2f}, '
+                f'{f.centroid_xy[1]:.2f}) [size={f.size}, score={score:.2f}]')
+            return
+
+        self.get_logger().warn('no reachable frontier this tick')
+        self._planner = None
+
+    def _is_frontier_eligible(self, inflated: OccupancyGrid, f) -> bool:
+        cc, cr = inflated.world_to_grid(*f.centroid_xy)
+        return ((cc, cr) not in self._blacklist
+                and inflated.is_traversable(cc, cr))
+
+    def _adopt_path(self, path: list[tuple[float, float]],
+                    goal_xy: tuple[float, float]) -> None:
+        self._planner = PurePursuit(path, PurePursuitConfig())
+        self._goal_xy = goal_xy
+        self._publish_path(path)
 
     def _nearby_free_world(self, grid: OccupancyGrid,
                            xy: tuple[float, float]
                            ) -> list[tuple[float, float]]:
-        """Return world (x, y) for free cells in a small ring around
-        ``xy`` in the inflated grid, ordered by distance."""
+        """Free-cell world coords in a small ring around ``xy`` in the
+        inflated grid, ordered by distance."""
         cc, cr = grid.world_to_grid(*xy)
         res = grid.spec.resolution
         ox, oy = grid.spec.origin_x, grid.spec.origin_y
@@ -347,53 +355,6 @@ class ExplorerNode(Node):
                 out.append((math.hypot(wx - xy[0], wy - xy[1]), (wx, wy)))
         out.sort()
         return [w for _, w in out]
-
-    def _replan_frontier(self, grid: OccupancyGrid,
-                         inflated: OccupancyGrid,
-                         rx: float, ry: float) -> None:
-        frontiers = find_frontiers(grid, min_size=self.frontier_min_size)
-        self._publish_frontiers(frontiers)
-
-        if not frontiers:
-            self.get_logger().info(
-                'No frontiers left — exploration complete.')
-            self._mode = 'done'
-            self._planner = None
-            return
-
-        # Score = size / distance: prefer big nearby frontiers. Skip
-        # blacklisted ones and any whose centroid isn't traversable in
-        # the inflated grid (we'd never reach it physically).
-        scored: list[tuple[float, object]] = []
-        for f in frontiers:
-            cc, cr = inflated.world_to_grid(*f.centroid_xy)
-            if (cc, cr) in self._blacklist:
-                continue
-            if not inflated.is_traversable(cc, cr):
-                continue
-            d = math.hypot(f.centroid_xy[0] - rx, f.centroid_xy[1] - ry)
-            if d < 1e-3:
-                continue
-            scored.append((f.size / d, f))
-        scored.sort(reverse=True)
-
-        for score, f in scored:
-            path = plan_path(inflated, (rx, ry), f.centroid_xy)
-            if path is None or len(path) < 2:
-                cc, cr = inflated.world_to_grid(*f.centroid_xy)
-                self._blacklist.add((cc, cr))
-                continue
-            self._planner = PurePursuit(path, PurePursuitConfig())
-            self._goal_xy = f.centroid_xy
-            self._publish_path(path)
-            self.get_logger().info(
-                f'Heading to frontier @ ({f.centroid_xy[0]:.2f}, '
-                f'{f.centroid_xy[1]:.2f}) [size={f.size}, score={score:.2f}]'
-            )
-            return
-
-        self.get_logger().warn('No reachable frontier this tick.')
-        self._planner = None
 
     # ===== helpers =======================================================
 
@@ -435,21 +396,14 @@ class ExplorerNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = None
+    node = ExplorerNode()
     try:
-        node = ExplorerNode()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        if node is not None:
-            try:
-                node.cmd_pub.publish(Twist())  # final stop
-            except Exception:
-                pass
-            node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        node.cmd_pub.publish(Twist())  # final stop
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
