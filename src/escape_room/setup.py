@@ -30,6 +30,7 @@ setup(
             "door_controller = escape_room.nodes.door_controller:main",
             "mapper_node = escape_room.nodes.mapper_node:main",
             "explorer_node = escape_room.nodes.explorer_node:main",
+            "color_detector_node = escape_room.nodes.color_detector_node:main",
         ],
     },
 )

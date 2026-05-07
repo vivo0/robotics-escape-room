@@ -185,12 +185,17 @@ def build_obstacle(sim, prim, obs, idx):
     return h
 
 
-def build_target_cube(sim, prim, cfg):
-    s = cfg["size"]
+def build_target_key(sim, prim, cfg):
+    """Place the "key" the robot must grasp and move.
+
+    A tall thin cylinder, much easier for the RoboMaster gripper to
+    pick up than a low cube. ``cfg["size"]`` is [diameter, diameter,
+    height] in metres.
+    """
     h = make_shape(
         sim,
-        prim["box"],
-        [s, s, s],
+        prim["cylinder"],
+        list(cfg["size"]),
         cfg["position"],
         color=cfg.get("color", (0.9, 0.2, 0.2)),
         name="TargetCube",
@@ -346,8 +351,8 @@ def main(scenario_path: str):
         build_obstacle(sim, prim, obs, i)
 
     if "target_cube" in cfg:
-        print("[builder] Placing target cube...")
-        build_target_cube(sim, prim, cfg["target_cube"])
+        print("[builder] Placing target key (cylinder)...")
+        build_target_key(sim, prim, cfg["target_cube"])
 
     if "pressure_plate" in cfg:
         print("[builder] Placing pressure plate...")
