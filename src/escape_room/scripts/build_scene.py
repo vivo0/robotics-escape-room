@@ -19,19 +19,21 @@ def make_shape(
     sim,
     prim_type,
     size,
-    position,
+    center,
     color=(0.7, 0.7, 0.7),
     name=None,
     static=True,
     respondable=True,
 ):
-    """Create a primitive shape and place it. Sizes are full extents in meters."""
+    """Create a primitive shape and place it. Sizes are full extents in meters.
+    Center is the shape's center in world coordinates (CoppeliaSim convention).
+    """
     handle = sim.createPrimitiveShape(prim_type, list(size), 0)
 
     if handle is None or handle < 0:
         raise RuntimeError(f"createPrimitiveShape returned invalid handle: {handle}")
 
-    sim.setObjectPosition(handle, list(position), -1)
+    sim.setObjectPosition(handle, list(center), -1)
     sim.setShapeColor(handle, "", sim.colorcomponent_ambient_diffuse, list(color))
     sim.setObjectInt32Param(handle, sim.shapeintparam_static, 1 if static else 0)
     sim.setObjectInt32Param(
@@ -42,174 +44,206 @@ def make_shape(
     return handle
 
 
-def _segments_around_gap(length, gap_w, gap_offset):
-    """Wall segments around a centered gap. Returns [(seg_length, seg_center), ...]."""
-    half = length / 2
-    gap_l = gap_offset - gap_w / 2
-    gap_r = gap_offset + gap_w / 2
+def _segments_around_doors(wall_length, door_centers):
+    """Return the solid wall segments that remain after cutting out door openings.
+
+    All coordinates are relative to the wall's center (positive = right).
+    The wall spans [-wall_length/2, +wall_length/2].
+
+    door_centers: list of (door_center, door_width), both relative to wall center.
+    Returns [(seg_length, seg_center), ...] sorted left-to-right, also relative
+    to wall center.
+    """
+    half = wall_length / 2
+    # Sort doors left-to-right by their left edge so the sweep works in one pass.
+    sorted_doors = sorted(door_centers, key=lambda d: d[0] - d[1] / 2)
     segments = []
-    if gap_l > -half:
-        segments.append((gap_l - (-half), (-half + gap_l) / 2))
-    if gap_r < half:
-        segments.append((half - gap_r, (gap_r + half) / 2))
+    # x is a cursor that starts at the wall's left edge and advances to each
+    # door's right edge, marking the start of the next potential solid segment.
+    x = -half
+    for door_center, door_w in sorted_doors:
+        door_l = door_center - door_w / 2  # left edge of this door
+        door_r = door_center + door_w / 2  # right edge of this door
+        if door_l < -half or door_r > half:
+            raise ValueError(
+                f"Door (center={door_center:.3f}, width={door_w:.3f}) "
+                f"exceeds wall bounds [{-half:.3f}, {half:.3f}]."
+            )
+        if door_l <= x:
+            raise ValueError(
+                f"Door (center={door_center:.3f}, width={door_w:.3f}) "
+                f"overlaps or is adjacent to the previous door (ends at {x:.3f})."
+            )
+        # Solid segment from x to door_l; its center is their midpoint.
+        segments.append((door_l - x, (x + door_l) / 2))
+        x = door_r
+    # Solid segment from last door's right edge to the wall's right edge.
+    if x < half:
+        segments.append((half - x, (x + half) / 2))
     return segments
 
 
-def build_walls(sim, prim, width, depth, height, thickness, door_cfg=None):
-    hw, hd = width / 2, depth / 2
-    walls = {
-        "north": dict(
-            axis="x",
-            length=width + 2 * thickness,
-            center=(0, hd + thickness / 2, height / 2),
-            name="WallNorth",
-        ),
-        "south": dict(
-            axis="x",
-            length=width + 2 * thickness,
-            center=(0, -hd - thickness / 2, height / 2),
-            name="WallSouth",
-        ),
-        "east": dict(
-            axis="y",
-            length=depth,
-            center=(hw + thickness / 2, 0, height / 2),
-            name="WallEast",
-        ),
-        "west": dict(
-            axis="y",
-            length=depth,
-            center=(-hw - thickness / 2, 0, height / 2),
-            name="WallWest",
-        ),
-    }
+def _door_center_from_wall(wall_side, door_cfg, width, length):
+    """Convert a door's JSON position to its center offset relative to the wall's center.
 
-    door_side = door_cfg["wall"] if door_cfg else None
-    door_w = door_cfg["width"] if door_cfg else 0.0
-    door_off = door_cfg.get("offset", 0.0) if door_cfg else 0.0
+    JSON position is the distance from the wall's left corner (viewed from inside).
+    The returned value is in the wall's local axis, centered at 0 — the
+    coordinate system used by _segments_around_doors and build_door.
+
+    Wall-side numbering (viewed from inside, from the left corner):
+      0 = North: position 0 → west end, increases east,  max = width
+      1 = East:  position 0 → north end, increases south, max = length
+      2 = South: position 0 → east end, increases west,  max = width
+      3 = West:  position 0 → south end, increases north, max = length
+    """
+    dw = door_cfg["width"]
+    offset = door_cfg["offset"]
+    if wall_side == 0:
+        return -width / 2 + offset + dw / 2
+    elif wall_side == 1:
+        return length / 2 - offset - dw / 2
+    elif wall_side == 2:
+        return width / 2 - offset - dw / 2
+    else:  # 3
+        return -length / 2 + offset + dw / 2
+
+
+def build_walls(sim, room_cfg):
+    width = room_cfg["width"]
+    length = room_cfg["length"]
+    height = room_cfg["height"]
+    thickness = room_cfg["wall_thickness"]
+    hw, hl = width / 2, length / 2
+    doors = room_cfg.get("doors", [])
+
+    # (wall_side, axis, full_wall_length, center_x, center_y, alias_prefix)
+    # N/S walls extend past corners (+2*thickness); E/W walls span the interior only.
+    walls = [
+        ("x", width + 2 * thickness, 0.0, hl + thickness / 2, "WallNorth"),
+        ("y", length, hw + thickness / 2, 0.0, "WallEast"),
+        ("x", width + 2 * thickness, 0.0, -(hl + thickness / 2), "WallSouth"),
+        ("y", length, -(hw + thickness / 2), 0.0, "WallWest"),
+    ]
 
     handles = []
-    for side, w in walls.items():
-        if side == door_side:
-            for i, (seg_len, seg_ctr) in enumerate(
-                _segments_around_gap(w["length"], door_w, door_off)
-            ):
-                if w["axis"] == "x":
-                    size = (seg_len, thickness, height)
-                    pos = (w["center"][0] + seg_ctr, w["center"][1], w["center"][2])
-                else:
-                    size = (thickness, seg_len, height)
-                    pos = (w["center"][0], w["center"][1] + seg_ctr, w["center"][2])
-                h = make_shape(
-                    sim,
-                    prim["box"],
-                    size,
-                    pos,
-                    color=(0.85, 0.85, 0.85),
-                    name=f"{w['name']}_{i}",
-                )
-                sim.setObjectSpecialProperty(
-                    h, sim.objectspecialproperty_detectable_all
-                )
-                handles.append(h)
-        else:
-            if w["axis"] == "x":
-                size = (w["length"], thickness, height)
+    for wall_side, (axis, wall_len, center_x, center_y, alias) in enumerate(walls):
+        doors = [d for d in doors if d["wall_side"] == wall_side]
+        door_centers = [
+            (_door_center_from_wall(wall_side, d, width, length), d["width"])
+            for d in doors
+        ]
+
+        for seg_idx, (seg_len, seg_center) in enumerate(
+            _segments_around_doors(wall_len, door_centers)
+        ):
+            if axis == "x":
+                size = (seg_len, thickness, height)
+                seg_center_x, seg_center_y = center_x + seg_center, center_y
             else:
-                size = (thickness, w["length"], height)
-            h = make_shape(
+                size = (thickness, seg_len, height)
+                seg_center_x, seg_center_y = center_x, center_y + seg_center
+
+            handle = make_shape(
                 sim,
-                prim["box"],
+                getattr(sim, "primitiveshape_cuboid"),
                 size,
-                w["center"],
+                (seg_center_x, seg_center_y, height / 2),
                 color=(0.85, 0.85, 0.85),
-                name=w["name"],
+                name=f"{alias}_{seg_idx}",
             )
-            sim.setObjectSpecialProperty(h, sim.objectspecialproperty_detectable_all)
-            handles.append(h)
+            sim.setObjectSpecialProperty(
+                handle, sim.objectspecialproperty_detectable_all
+            )
+            handles.append(handle)
     return handles
 
 
-def build_door(sim, prim, room, door_cfg):
-    """Place a Door box that fills the gap left in one of the room walls."""
-    width, depth = room["size"][0], room["size"][1]
-    thickness = room["wall_thickness"]
-    height = room["wall_height"]
-    hw, hd = width / 2, depth / 2
+def build_door(sim, room_cfg, door_cfg, door_idx):
+    """Place a door panel that fills the gap left in one of the room walls."""
+    width = room_cfg["width"]
+    length = room_cfg["length"]
+    thickness = room_cfg["wall_thickness"]
+    height = room_cfg["height"]
+    hw, hl = width / 2, length / 2
 
-    side = door_cfg["wall"]
+    wall_side = door_cfg["wall_side"]
     door_w = door_cfg["width"]
-    offset = door_cfg.get("offset", 0.0)
     color = door_cfg.get("color", (0.55, 0.30, 0.15))
 
-    if side == "north":
-        size = (door_w, thickness, height)
-        pos = (offset, hd + thickness / 2, height / 2)
-    elif side == "south":
-        size = (door_w, thickness, height)
-        pos = (offset, -hd - thickness / 2, height / 2)
-    elif side == "east":
-        size = (thickness, door_w, height)
-        pos = (hw + thickness / 2, offset, height / 2)
-    elif side == "west":
-        size = (thickness, door_w, height)
-        pos = (-hw - thickness / 2, offset, height / 2)
-    else:
-        raise ValueError(f"Unknown door wall: {side}")
+    door_center = _door_center_from_wall(wall_side, door_cfg, width, length)
 
-    h = make_shape(
+    if wall_side == 0:
+        size = (door_w, thickness, height)
+        center_x, center_y = door_center, hl + thickness / 2
+    elif wall_side == 1:
+        size = (thickness, door_w, height)
+        center_x, center_y = hw + thickness / 2, door_center
+    elif wall_side == 2:
+        size = (door_w, thickness, height)
+        center_x, center_y = door_center, -(hl + thickness / 2)
+    elif wall_side == 3:
+        size = (thickness, door_w, height)
+        center_x, center_y = -(hw + thickness / 2), door_center
+    else:
+        raise ValueError(f"Unknown wall_side: {wall_side}")
+
+    handle = make_shape(
         sim,
-        prim["box"],
+        getattr(sim, "primitiveshape_cuboid"),
         size,
-        pos,
+        (center_x, center_y, height / 2),
         color=color,
-        name="Door",
+        name=f"Door_{door_idx}",
         static=True,
         respondable=True,
     )
-    sim.setObjectSpecialProperty(h, sim.objectspecialproperty_detectable_all)
-    return h
+    sim.setObjectSpecialProperty(handle, sim.objectspecialproperty_detectable_all)
+    return handle
 
 
-def build_obstacle(sim, prim, obs, idx):
+_PRIM_TYPE = {"box": "cuboid", "cylinder": "cylinder"}
+
+
+def build_obstacle(sim, obs, idx):
     color = obs.get("color", (0.4, 0.4, 0.5))
-    h = make_shape(
+    prim = getattr(sim, f"primitiveshape_{_PRIM_TYPE[obs['type']]}")
+    handle = make_shape(
         sim,
-        prim[obs["type"]],
+        prim,
         obs["size"],
         obs["position"],
         color=color,
         name=f"Obstacle_{idx}",
     )
-    sim.setObjectSpecialProperty(h, sim.objectspecialproperty_detectable_all)
-    return h
+    sim.setObjectSpecialProperty(handle, sim.objectspecialproperty_detectable_all)
+    return handle
 
 
-def build_target_key(sim, prim, cfg):
+def build_target_key(sim, cfg):
     """Place the "key" the robot must grasp and move.
 
     A tall thin cylinder, much easier for the RoboMaster gripper to
     pick up than a low cube. ``cfg["size"]`` is [diameter, diameter,
     height] in metres.
     """
-    h = make_shape(
+    handle = make_shape(
         sim,
-        prim["cylinder"],
-        list(cfg["size"]),
+        getattr(sim, "primitiveshape_cylinder"),
+        cfg["size"],
         cfg["position"],
         color=cfg.get("color", (0.9, 0.2, 0.2)),
         name="TargetCube",
         static=False,
     )
-    sim.setObjectSpecialProperty(h, sim.objectspecialproperty_detectable_all)
-    sim.setObjectInt32Param(h, sim.shapeintparam_static, 0)
-    return h
+    sim.setObjectSpecialProperty(handle, sim.objectspecialproperty_detectable_all)
+    sim.setObjectInt32Param(handle, sim.shapeintparam_static, 0)
+    return handle
 
 
-def build_pressure_plate(sim, prim, cfg):
+def build_pressure_plate(sim, cfg):
     h = make_shape(
         sim,
-        prim["box"],
+        getattr(sim, "primitiveshape_cuboid"),
         cfg["size"],
         cfg["position"],
         color=cfg.get("color", (0.2, 0.6, 0.9)),
@@ -303,12 +337,6 @@ def main(scenario_path: str):
     client = RemoteAPIClient()
     sim = client.require("sim")
 
-    # Resolve primitive type constants from the running sim
-    prim = {
-        "box": sim.primitiveshape_cuboid,
-        "cylinder": sim.primitiveshape_cylinder,
-    }
-
     if sim.getSimulationState() != sim.simulation_stopped:
         print("[builder] Stopping running simulation...")
         sim.stopSimulation()
@@ -318,34 +346,27 @@ def main(scenario_path: str):
     print("[builder] Clearing scene...")
     clear_scene(sim)
 
-    print("[builder] Building walls...")
     room = cfg["room"]
-    door_cfg = cfg.get("door")
-    build_walls(
-        sim,
-        prim,
-        width=room["size"][0],
-        depth=room["size"][1],
-        height=room["wall_height"],
-        thickness=room["wall_thickness"],
-        door_cfg=door_cfg,
-    )
+    doors = room.get("doors", [])
 
-    if door_cfg is not None:
-        print(f"[builder] Placing door on {door_cfg['wall']} wall...")
-        build_door(sim, prim, room, door_cfg)
+    print("[builder] Building walls...")
+    build_walls(sim, room)
+
+    for i, door_cfg in enumerate(doors):
+        print(f"[builder] Placing door {i} on wall_side {door_cfg['wall_side']}...")
+        build_door(sim, room, door_cfg, i)
 
     print(f"[builder] Building {len(cfg.get('obstacles', []))} obstacles...")
     for i, obs in enumerate(cfg.get("obstacles", [])):
-        build_obstacle(sim, prim, obs, i)
+        build_obstacle(sim, obs, i)
 
     if "target_cube" in cfg:
-        print("[builder] Placing target key (cylinder)...")
-        build_target_key(sim, prim, cfg["target_cube"])
+        print("[builder] Placing target cube...")
+        build_target_key(sim, cfg["target_cube"])
 
     if "pressure_plate" in cfg:
         print("[builder] Placing pressure plate...")
-        build_pressure_plate(sim, prim, cfg["pressure_plate"])
+        build_pressure_plate(sim, cfg["pressure_plate"])
 
     if "robot" in cfg:
         print(f"[builder] Loading robot: {cfg['robot']['model']}...")

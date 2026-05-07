@@ -1,8 +1,12 @@
 {
   "room": {
-    "size": [5.0, 4.0],
-    "wall_height": 0.5,
-    "wall_thickness": 0.05
+    "width": 5.0,
+    "length": 4.0,
+    "height": 0.5,
+    "wall_thickness": 0.05,
+    "doors": [
+      {"wall_side": 0, "width": 0.8, "offset": 0.0, "color": [0.1, 0.3, 0.9]}
+    ]
   },
   "robot": {
     "model": "RoboMasterEP",
@@ -24,11 +28,5 @@
     "position": [-1.5, 1.5, 0.001],
     "size": [0.3, 0.3, 0.002],
     "color": [0.1, 0.8, 0.2]
-  },
-  "door": {
-    "wall": "north",
-    "width": 0.8,
-    "offset": 0.0,
-    "color": [0.1, 0.3, 0.9]
   }
 }
