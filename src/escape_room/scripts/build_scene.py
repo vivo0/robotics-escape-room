@@ -104,7 +104,7 @@ def build_walls(sim, room_cfg):
     handles = []
     for wall_side, (axis, wall_len, center_x, center_y, alias) in enumerate(walls):
         doors = [d for d in doors if d["wall_side"] == wall_side]
-        door_centers = [(d["center_pos"], d["width"]) for d in doors]
+        door_centers = [(d["center_offset"], d["width"]) for d in doors]
 
         for seg_idx, (seg_len, seg_center) in enumerate(
             _segments_around_doors(wall_len, door_centers)
@@ -143,7 +143,7 @@ def build_door(sim, room_cfg, door_cfg, door_idx):
     door_w = door_cfg["width"]
     color = door_cfg.get("color", (0.55, 0.30, 0.15))
 
-    door_center = door_cfg["center_pos"]
+    door_center = door_cfg["center_offset"]
 
     if wall_side == 0:
         size = (door_w, thickness, height)
