@@ -83,30 +83,6 @@ def _segments_around_doors(wall_length, door_centers):
     return segments
 
 
-def _door_center_from_wall(wall_side, door_cfg, width, length):
-    """Convert a door's JSON position to its center offset relative to the wall's center.
-
-    JSON position is the distance from the wall's left corner (viewed from inside).
-    The returned value is in the wall's local axis, centered at 0 — the
-    coordinate system used by _segments_around_doors and build_door.
-
-    Wall-side numbering (viewed from inside, from the left corner):
-      0 = North: position 0 → west end, increases east,  max = width
-      1 = East:  position 0 → north end, increases south, max = length
-      2 = South: position 0 → east end, increases west,  max = width
-      3 = West:  position 0 → south end, increases north, max = length
-    """
-    dw = door_cfg["width"]
-    offset = door_cfg["offset"]
-    if wall_side == 0:
-        return -width / 2 + offset + dw / 2
-    elif wall_side == 1:
-        return length / 2 - offset - dw / 2
-    elif wall_side == 2:
-        return width / 2 - offset - dw / 2
-    else:  # 3
-        return -length / 2 + offset + dw / 2
-
 
 def build_walls(sim, room_cfg):
     width = room_cfg["width"]
@@ -128,10 +104,7 @@ def build_walls(sim, room_cfg):
     handles = []
     for wall_side, (axis, wall_len, center_x, center_y, alias) in enumerate(walls):
         doors = [d for d in doors if d["wall_side"] == wall_side]
-        door_centers = [
-            (_door_center_from_wall(wall_side, d, width, length), d["width"])
-            for d in doors
-        ]
+        door_centers = [(d["center_pos"], d["width"]) for d in doors]
 
         for seg_idx, (seg_len, seg_center) in enumerate(
             _segments_around_doors(wall_len, door_centers)
@@ -170,7 +143,7 @@ def build_door(sim, room_cfg, door_cfg, door_idx):
     door_w = door_cfg["width"]
     color = door_cfg.get("color", (0.55, 0.30, 0.15))
 
-    door_center = _door_center_from_wall(wall_side, door_cfg, width, length)
+    door_center = door_cfg["center_pos"]
 
     if wall_side == 0:
         size = (door_w, thickness, height)
