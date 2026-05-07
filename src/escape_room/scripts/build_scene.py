@@ -244,26 +244,15 @@ def load_robot(sim, robot_cfg):
     if handle < 0:
         raise RuntimeError(f"loadModel failed for {model_path}")
 
-    # Read the pose the model assumed naturally on load
-    natural_pos = sim.getObjectPosition(handle, -1)
-    natural_orient = sim.getObjectOrientation(handle, -1)
+    pos = robot_cfg["position"]
+    sim.setObjectPosition(handle, pos, -1)
 
-    # Override only x, y from the JSON; keep the model's natural z
-    target_pos = [
-        robot_cfg["position"][0],
-        robot_cfg["position"][1],
-        natural_pos[2],
-    ]
-
-    # Override only yaw; keep natural roll and pitch (should already be ~0).
-    # Accept either a scalar yaw or a [roll, pitch, yaw] triple in degrees.
-    orient_deg = robot_cfg.get("orientation_deg", 0)
-    yaw_deg = orient_deg[-1] if isinstance(orient_deg, (list, tuple)) else orient_deg
-    yaw_rad = math.radians(yaw_deg)
-    target_orient = [natural_orient[0], natural_orient[1], yaw_rad]
-
-    sim.setObjectPosition(handle, target_pos, -1)
-    sim.setObjectOrientation(handle, target_orient, -1)
+    orient = robot_cfg.get("orientation", [0, 0, 0])
+    m = sim.getObjectMatrix(handle, -1)
+    m = sim.rotateAroundAxis(m, [1, 0, 0], pos, math.radians(orient[0]))
+    m = sim.rotateAroundAxis(m, [0, 1, 0], pos, math.radians(orient[1]))
+    m = sim.rotateAroundAxis(m, [0, 0, 1], pos, math.radians(orient[2]))
+    sim.setObjectMatrix(handle, -1, m)
     sim.setObjectAlias(handle, model_name)
 
     # Reset physics for the whole model subtree to avoid teleport explosions
