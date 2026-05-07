@@ -78,7 +78,7 @@ Scenarios live in `src/escape_room/scenarios/`. Each file fully describes the ro
 - `obstacles` — list of `box`/`cylinder` primitives
 - `target_cube`, `pressure_plate`, `door` — landmark positions, sizes, and RGB colours
 
-Object colours must match the HSV ranges in `escape_room_pipeline.md` (cube: red 0–10°/170–180°; plate: green 40–80°; door: blue 100–130°).
+Object colours must match the HSV ranges in `color_detector_node.py` (cube: magenta ~280–340°; plate: green 80–160°; door: blue 200–260°). The key avoids red (Velodyne beams render red in the camera frame) and yellow (the CoppeliaSim default floor pattern is yellow); magenta is the safe distinct hue.
 
 ### Key source locations
 
