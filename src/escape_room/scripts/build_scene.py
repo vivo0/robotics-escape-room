@@ -258,7 +258,7 @@ def load_robot(sim, robot_cfg):
     # Override only yaw; keep natural roll and pitch (should already be ~0).
     # Accept either a scalar yaw or a [roll, pitch, yaw] triple in degrees.
     orient_deg = robot_cfg.get("orientation_deg", 0)
-    yaw_deg = orient_deg[-1] if isinstance(orient_deg, (list, tuple)) else orient_deg
+    yaw_deg = orient_deg
     yaw_rad = math.radians(yaw_deg)
     target_orient = [natural_orient[0], natural_orient[1], yaw_rad]
 
