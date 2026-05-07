@@ -1,9 +1,10 @@
 """
 A* path planning on an OccupancyGrid.
 
-Works on the inflated grid: only FREE cells are traversable (UNKNOWN is
-treated as blocked, so the planner never crosses unexplored space).
-8-connected with octile heuristic; returns world-frame waypoints.
+Operates on the inflated grid: only FREE cells are traversable
+(UNKNOWN is treated as blocked, so the planner never crosses
+unexplored space). 8-connected with the octile heuristic — admissible
+on grids that allow diagonal moves at cost √2.
 """
 from __future__ import annotations
 
@@ -13,12 +14,12 @@ import math
 from escape_room.mapping.occupancy_grid import OccupancyGrid
 
 
-# 8-connected neighbour offsets and their step costs
-_NEIGHBOURS = [
+# 8-connected neighbour offsets and their step costs (col_delta, row_delta, cost).
+_NEIGHBOURS = (
     (-1,  0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
     (-1, -1, math.sqrt(2)), (-1, 1, math.sqrt(2)),
     (1, -1, math.sqrt(2)),  (1, 1, math.sqrt(2)),
-]
+)
 
 
 def _octile(c0: int, r0: int, c1: int, r1: int) -> float:
@@ -30,18 +31,16 @@ def _octile(c0: int, r0: int, c1: int, r1: int) -> float:
 
 def plan_path(grid: OccupancyGrid,
               start_xy: tuple[float, float],
-              goal_xy: tuple[float, float]) -> list[tuple[float, float]] | None:
-    """A* on `grid`. Returns a list of world (x, y) waypoints from start to
+              goal_xy: tuple[float, float],
+              ) -> list[tuple[float, float]] | None:
+    """A* on ``grid``. Returns world (x, y) waypoints from start to
     goal (inclusive of both endpoints), or None if unreachable.
 
-    `grid` is expected to already be inflated by the robot radius.
+    ``grid`` is expected to be already inflated by the robot radius.
     """
     sc, sr = grid.world_to_grid(*start_xy)
     gc, gr = grid.world_to_grid(*goal_xy)
 
-    # If start sits on a non-traversable cell (e.g. inflation hugs the wall
-    # right where the robot is), allow it as a starting point anyway —
-    # otherwise we'd never plan when the robot is wedged near a wall.
     if not grid.in_bounds(sc, sr) or not grid.in_bounds(gc, gr):
         return None
     if not grid.is_traversable(gc, gr):
@@ -56,7 +55,7 @@ def plan_path(grid: OccupancyGrid,
     heapq.heappush(open_heap, (0.0, 0, start))
     g_score: dict[tuple[int, int], float] = {start: 0.0}
     came_from: dict[tuple[int, int], tuple[int, int]] = {}
-    counter = 1  # tiebreaker for heap order
+    counter = 1  # tiebreaker so the heap never compares tuples by node
 
     while open_heap:
         _, _, current = heapq.heappop(open_heap)
@@ -68,10 +67,11 @@ def plan_path(grid: OccupancyGrid,
             nc, nr = cc + dc, cr + dr
             if not grid.in_bounds(nc, nr):
                 continue
-            if not grid.is_traversable(nc, nr):
-                # Only block if it's NOT the start cell — see comment above
-                if (nc, nr) != start:
-                    continue
+            # Allow leaving the start cell even if the inflation hugs
+            # right next to the robot (otherwise we could never plan
+            # when the robot is wedged near a wall).
+            if not grid.is_traversable(nc, nr) and (nc, nr) != start:
+                continue
             tentative = g_score[current] + step
             nb = (nc, nr)
             if tentative < g_score.get(nb, math.inf):
@@ -88,8 +88,11 @@ def _reconstruct(grid: OccupancyGrid,
                  came_from: dict,
                  end: tuple[int, int],
                  start_xy: tuple[float, float],
-                 goal_xy: tuple[float, float]) -> list[tuple[float, float]]:
-    """Walk came_from back to start; convert to world (x, y) cell centers."""
+                 goal_xy: tuple[float, float],
+                 ) -> list[tuple[float, float]]:
+    """Walk ``came_from`` back to start, return world (x, y) cell centers.
+    The first/last entries are replaced with the exact metric endpoints
+    requested so pure pursuit doesn't need to snap to cell centers."""
     path_cells = [end]
     while end in came_from:
         end = came_from[end]
@@ -102,7 +105,6 @@ def _reconstruct(grid: OccupancyGrid,
         (ox + (c + 0.5) * res, oy + (r + 0.5) * res)
         for c, r in path_cells
     ]
-    # Replace endpoints with the exact metric values asked for
     waypoints[0] = start_xy
     waypoints[-1] = goal_xy
     return waypoints
