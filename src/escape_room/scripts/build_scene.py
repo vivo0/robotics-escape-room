@@ -269,6 +269,75 @@ def load_robot(sim, robot_cfg):
         except Exception:
             pass
 
+    # Inject Lua wrappers into the gripper_link_respondable child
+    # script so external Python code (explorer_node) can drive the
+    # gripper. The CoppeliaSim signal API is unreliable across
+    # contexts in modern versions, so we monkey-patch
+    # ``sim.setInt32Signal`` / ``sim.getInt32Signal`` *inside this
+    # script's environment* to use a Lua-table backing store for the
+    # two state signals. That guarantees that the writes done by
+    # ``sysCall_init`` (line 55-56), the reads in ``sysCall_actuation``
+    # (line 146-147) and our external setters all share the same
+    # storage. ``_ext_diag`` returns a string with the script's
+    # internal state for debugging.
+    helpers = (
+        '\n-- ===== EXT GRIPPER CONTROL (injected) =====\n'
+        '_ext_target_state = 0\n'
+        '_ext_current_state = 0\n'
+        'local _ext_orig_set = sim.setInt32Signal\n'
+        'local _ext_orig_get = sim.getInt32Signal\n'
+        'sim.setInt32Signal = function(name, val)\n'
+        '  if name == target_state_signal then _ext_target_state = val\n'
+        '  elseif name == current_state_signal then _ext_current_state = val\n'
+        '  else _ext_orig_set(name, val) end\n'
+        'end\n'
+        'sim.getInt32Signal = function(name)\n'
+        '  if name == target_state_signal then return _ext_target_state end\n'
+        '  if name == current_state_signal then return _ext_current_state end\n'
+        '  return _ext_orig_get(name)\n'
+        'end\n'
+        'function _ext_set_target(state_int)\n'
+        '  _ext_target_state = state_int\n'
+        'end\n'
+        'function _ext_get_state()\n'
+        '  return _ext_current_state\n'
+        'end\n'
+        'function _ext_diag()\n'
+        '  return string.format(\n'
+        '    "tgt_sig=%s cur_sig=%s h=%s tgt=%s cur=%s pos=%s",\n'
+        '    tostring(target_state_signal),\n'
+        '    tostring(current_state_signal),\n'
+        '    tostring(h),\n'
+        '    tostring(_ext_target_state),\n'
+        '    tostring(_ext_current_state),\n'
+        '    tostring(h and sim.getJointPosition(h) or "nil"))\n'
+        'end\n'
+    )
+    try:
+        gripper_h = None
+        for h in sim.getObjectsInTree(handle):
+            try:
+                if (sim.getObjectAlias(int(h), 0)
+                        == 'gripper_link_respondable'):
+                    gripper_h = int(h)
+                    break
+            except Exception:
+                continue
+        if gripper_h is None:
+            print('[builder] WARN: gripper_link_respondable not found')
+        else:
+            script_h = sim.getScript(1, gripper_h)   # 1 = child script
+            if script_h and script_h > 0:
+                src = sim.getScriptStringParam(
+                    script_h, sim.scriptstringparam_text)
+                if 'function _ext_diag' not in src:
+                    sim.setScriptStringParam(
+                        script_h, sim.scriptstringparam_text, src + helpers)
+                    print('[builder] injected gripper helpers + signal '
+                          'shim into gripper_link_respondable child script')
+    except Exception as e:
+        print(f'[builder] WARN: gripper helpers injection failed: {e}')
+
     return handle
 
 

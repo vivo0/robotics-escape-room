@@ -5,8 +5,11 @@ A cell is OCCUPIED when ``occ`` is True (priority over everything),
 FREE when ``free`` is True and not occupied, and UNKNOWN otherwise.
 
 The grid is permissive about repeated observations:
-    - An OCC mark, once set, is permanent (suits the static simulated world).
-    - FREE marks accumulate; OCC always overrides FREE in the public view.
+    - OCC and FREE marks both accumulate, but each cell is updated
+      every tick: a ray that reaches a cell sets ``free`` and clears
+      ``occ``; a ray that hits an obstacle in that cell sets ``occ``.
+      That way dynamic obstacles (e.g. the escape-room door, which
+      slides under the floor when opened) stop blocking A*.
     - Cells never written to remain UNKNOWN.
 
 This module is consumed by the planner (A*) and the frontier detector;

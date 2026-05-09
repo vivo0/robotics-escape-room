@@ -101,9 +101,12 @@ class MapperNode(Node):
 
         # ---- one-shot setup -----------------------------------------
         self._publish_world_to_odom_tf()
-        self.obstacles = self._enumerate_obstacles()
+        # Cached at init: handle + local bbox extents for each obstacle.
+        # Per-tick world AABBs are computed from current sim pose.
+        self.obstacle_specs = self._enumerate_obstacles()
         self.get_logger().info(
-            f'Found {len(self.obstacles)} obstacle(s) in the scene.')
+            f'Found {len(self.obstacle_specs)} obstacle(s) in the scene.')
+        self.obstacles = self._refresh_obstacle_aabbs()
 
         self._cell_x, self._cell_y = self._grid_cell_centers(spec)
         self._obstacle_mask = self._compute_obstacle_mask()
@@ -180,22 +183,65 @@ class MapperNode(Node):
 
     def _enumerate_obstacles(self) -> list[dict]:
         """List Wall*/Obstacle_*/Door/PressurePlate objects with their
-        world-axis-aligned XY bounding box."""
+        world-axis-aligned XY bounding box. Cached in
+        ``self.obstacle_specs`` once at init: only handle + local bbox
+        extents (which never change). Per-tick world AABBs are
+        recomputed in ``_refresh_obstacle_aabbs`` from current sim
+        position/yaw."""
+        sim = self.sim
         out: list[dict] = []
-        for handle in self.sim.getObjectsInTree(self.sim.handle_scene):
+        for handle in sim.getObjectsInTree(sim.handle_scene):
             try:
-                alias = self.sim.getObjectAlias(handle, 0)
+                alias = sim.getObjectAlias(handle, 0)
             except Exception:
                 continue
             if not alias.startswith(_OBSTACLE_PREFIXES):
                 continue
             try:
-                aabb = self._world_xy_aabb(handle)
+                x0 = sim.getObjectFloatParam(
+                    handle, sim.objfloatparam_objbbox_min_x)
+                y0 = sim.getObjectFloatParam(
+                    handle, sim.objfloatparam_objbbox_min_y)
+                x1 = sim.getObjectFloatParam(
+                    handle, sim.objfloatparam_objbbox_max_x)
+                y1 = sim.getObjectFloatParam(
+                    handle, sim.objfloatparam_objbbox_max_y)
             except Exception as e:
                 self.get_logger().warn(
-                    f"Could not compute AABB for '{alias}': {e}")
+                    f"Could not read local bbox for '{alias}': {e}")
                 continue
-            out.append({'alias': alias, 'aabb': aabb})
+            out.append({'handle': int(handle), 'alias': alias,
+                        'extents': (x0, y0, x1, y1)})
+        return out
+
+    def _refresh_obstacle_aabbs(self) -> list[dict]:
+        """Re-query each cached obstacle's world position + yaw and
+        rebuild its world XY AABB. Objects whose Z drops below the
+        floor (e.g. the door, which slides under after opening) are
+        filtered out so they no longer block A*. Returned list is
+        consumed by ``_compute_obstacle_mask``."""
+        out: list[dict] = []
+        for spec in self.obstacle_specs:
+            try:
+                pos = self.sim.getObjectPosition(spec['handle'], -1)
+            except Exception:
+                continue
+            # The door slides to negative Z when opened; treat it as
+            # not-an-obstacle in that case so cells underneath become
+            # navigable.
+            if pos[2] < -0.05:
+                continue
+            try:
+                yaw = self.sim.getObjectOrientation(spec['handle'], -1)[2]
+            except Exception:
+                continue
+            x0, y0, x1, y1 = spec['extents']
+            c, s = math.cos(yaw), math.sin(yaw)
+            local_corners = ((x0, y0), (x0, y1), (x1, y0), (x1, y1))
+            wx = [pos[0] + c * x - s * y for x, y in local_corners]
+            wy = [pos[1] + s * x + c * y for x, y in local_corners]
+            out.append({'alias': spec['alias'],
+                        'aabb': (min(wx), min(wy), max(wx), max(wy))})
         return out
 
     def _world_xy_aabb(self, handle: int
@@ -249,6 +295,11 @@ class MapperNode(Node):
             )
             return
         rx, ry = float(mat[3]), float(mat[7])
+        # Re-poll obstacle positions: the door slides under the floor
+        # when opened and must drop out of the obstacle mask so A* can
+        # plan through.
+        self.obstacles = self._refresh_obstacle_aabbs()
+        self._obstacle_mask = self._compute_obstacle_mask()
         self._virtual_scan(rx, ry)
         self._has_data = True
 
@@ -257,7 +308,13 @@ class MapperNode(Node):
         mask. Cells along each ray become FREE up to the first
         obstacle (which becomes OCC). Cells beyond ``max_range`` or
         behind an obstacle stay UNKNOWN — that's how movement-driven
-        discovery is preserved."""
+        discovery is preserved.
+
+        When a ray passes through a cell that is no longer in the
+        obstacle mask but used to be marked OCC (e.g. the wall cells
+        the door used to occupy, after the door slides under the
+        floor), we also CLEAR ``occ`` for that cell. This is what
+        lets A* plan through the door once it's open."""
         spec = self.grid.spec
         res = spec.resolution
         max_steps = int(math.ceil(self.max_range / res))
@@ -289,6 +346,10 @@ class MapperNode(Node):
                     occ[rr, c] = True
                     break
                 free[rr, c] = True
+                # If a ray passes through a cell, the cell is empty
+                # right now — clear any stale OCC from when an
+                # obstacle (e.g. the now-open door) was there.
+                occ[rr, c] = False
 
         # The robot's own cell is observed-free.
         rcol, rrow = self.grid.world_to_grid(rx, ry)
