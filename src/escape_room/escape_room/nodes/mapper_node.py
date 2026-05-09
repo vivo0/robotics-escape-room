@@ -1,34 +1,23 @@
 #!/usr/bin/env python3
-"""
-ROS2 node that paints a 2D occupancy grid by querying CoppeliaSim
-directly for the obstacle layout, instead of ray-casting a published
-LiDAR cloud.
+"""2D occupancy-grid mapper backed by direct CoppeliaSim queries.
 
-Why not the LiDAR
------------------
-In simulation we know the position of every wall and obstacle exactly:
-they were placed by ``build_scene.py``. The Velodyne cloud, on the
-other hand, doesn't synchronise cleanly with sim physics steps; if we
-ray-cast it as the robot moves, walls smear because the same cell gets
-re-marked at slightly different positions across scans. Reading the
-scene state directly produces a deterministic, perfect map: every
-obstacle is painted exactly once, in the right cells.
+In simulation we know every wall and obstacle pose exactly (they
+were placed by ``build_scene.py``), so we don't need to ray-cast a
+real LiDAR cloud — those scans don't synchronise cleanly with the
+physics step and walls smear across cells.
 
-Discovery semantics are preserved
----------------------------------
-The map is not pre-filled. Each tick, only cells within ``max_range``
-of the robot's *current* position are updated. A virtual scan of N
-rays from the robot through the obstacle mask ensures cells behind a
-wall stay UNKNOWN until the robot moves to a position where the wall
-no longer occludes them. So frontier exploration still does its job:
-the robot has to physically move to discover.
+Discovery semantics are still preserved by a virtual scan: each
+tick, only cells within ``max_range`` of the robot's current pose
+are updated by ``scan_rays`` rays. Cells behind a wall stay UNKNOWN
+until the robot moves to a position that exposes them, so frontier
+exploration still does its job.
 
 Subscribes:
     (none — pose and obstacle layout both come from CoppeliaSim ZMQ.)
 
 Publishes:
-    /map        (nav_msgs/OccupancyGrid, in ``world`` frame, ~2 Hz)
-    /tf_static  (one-shot ``world -> odom`` transform)
+    /map        nav_msgs/OccupancyGrid (in ``world`` frame, ~2 Hz)
+    /tf_static  one-shot ``world -> odom`` transform
 """
 from __future__ import annotations
 
@@ -50,119 +39,97 @@ from escape_room.mapping.occupancy_grid import GridSpec, OccupancyGrid
 
 
 # Object-alias prefixes treated as obstacles when enumerating the scene.
-# These match the names build_scene.py assigns to its primitives.
+# Match the names build_scene.py assigns to its primitives.
 _OBSTACLE_PREFIXES = ('Wall', 'Obstacle_', 'Door', 'PressurePlate')
+
+# Z-threshold below which an obstacle is considered "removed". The
+# escape-room door slides under the floor when opened (z ≈ -0.30 m);
+# excluding it from the mask + clearing OCC on ray pass-through is
+# what lets A* plan through after the door opens.
+_BELOW_FLOOR_Z = -0.05
 
 
 class MapperNode(Node):
+
     def __init__(self) -> None:
         super().__init__('mapper_node')
 
-        # ---- parameters ---------------------------------------------
-        self.declare_parameter('grid_width_m', 10.0)
-        self.declare_parameter('grid_height_m', 10.0)
-        self.declare_parameter('resolution', 0.10)
-        self.declare_parameter('origin_x', -5.0)
-        self.declare_parameter('origin_y', -5.0)
-        self.declare_parameter('max_range', 6.0)
-        self.declare_parameter('publish_rate_hz', 2.0)
-        self.declare_parameter('process_rate_hz', 5.0)
-        self.declare_parameter('map_topic', '/map')
-        self.declare_parameter('map_frame', 'world')
-        self.declare_parameter('robot_alias', '/RoboMasterEP/BaseLinkFrame')
-        # 720 rays = every 0.5°. Higher = finer occlusion detection.
-        self.declare_parameter('scan_rays', 720)
+        # ----- parameters --------------------------------------------
+        p = self.declare_parameter
+        p('grid_width_m',     10.0)
+        p('grid_height_m',    10.0)
+        p('resolution',       0.10)
+        p('origin_x',         -5.0)
+        p('origin_y',         -5.0)
+        p('max_range',        6.0)
+        p('publish_rate_hz',  2.0)
+        p('process_rate_hz',  5.0)
+        p('map_topic',        '/map')
+        p('map_frame',        'world')
+        p('robot_alias',      '/RoboMasterEP/BaseLinkFrame')
+        p('scan_rays',        720)   # 720 = every 0.5°
 
-        self.map_frame = str(self.get_parameter('map_frame').value)
-        self.max_range = float(self.get_parameter('max_range').value)
-        self.scan_rays = int(self.get_parameter('scan_rays').value)
-        robot_alias = str(self.get_parameter('robot_alias').value)
+        g = lambda n: self.get_parameter(n).value
+        self.map_frame = g('map_frame')
+        self.max_range = float(g('max_range'))
+        self.scan_rays = int(g('scan_rays'))
 
         spec = GridSpec(
-            width_m=float(self.get_parameter('grid_width_m').value),
-            height_m=float(self.get_parameter('grid_height_m').value),
-            resolution=float(self.get_parameter('resolution').value),
-            origin_x=float(self.get_parameter('origin_x').value),
-            origin_y=float(self.get_parameter('origin_y').value),
+            width_m=float(g('grid_width_m')),
+            height_m=float(g('grid_height_m')),
+            resolution=float(g('resolution')),
+            origin_x=float(g('origin_x')),
+            origin_y=float(g('origin_y')),
         )
         self.grid = OccupancyGrid(spec)
 
-        # ---- sim connection -----------------------------------------
-        self.get_logger().info('Connecting to CoppeliaSim ZMQ remote API...')
+        # ----- sim connection ----------------------------------------
         self.client = RemoteAPIClient()
         self.sim = self.client.require('sim')
-        try:
-            self.robot_handle = self.sim.getObject(robot_alias)
-        except Exception as e:
-            raise RuntimeError(
-                f"Could not resolve robot alias '{robot_alias}'. "
-                f"Run build_scene first. ({e})"
-            )
+        self.robot_handle = self.sim.getObject(g('robot_alias'))
 
-        # ---- one-shot setup -----------------------------------------
+        # ----- one-shot setup ----------------------------------------
         self._publish_world_to_odom_tf()
-        # Cached at init: handle + local bbox extents for each obstacle.
-        # Per-tick world AABBs are computed from current sim pose.
+
+        # Cache obstacle handles + local bbox extents at init; recompute
+        # world AABBs every tick so the door (which slides underground
+        # when opened) drops out of the mask.
         self.obstacle_specs = self._enumerate_obstacles()
         self.get_logger().info(
-            f'Found {len(self.obstacle_specs)} obstacle(s) in the scene.')
+            f'found {len(self.obstacle_specs)} obstacle(s) in the scene')
         self.obstacles = self._refresh_obstacle_aabbs()
 
-        self._cell_x, self._cell_y = self._grid_cell_centers(spec)
+        self._cell_x, self._cell_y = self._grid_cell_centres(spec)
         self._obstacle_mask = self._compute_obstacle_mask()
 
         angles = np.linspace(0.0, 2.0 * np.pi, self.scan_rays, endpoint=False)
         self._ray_dx = np.cos(angles)
         self._ray_dy = np.sin(angles)
 
-        # ---- ROS publishers -----------------------------------------
-        latched_qos = QoSProfile(
+        # ----- ROS publisher -----------------------------------------
+        latched = QoSProfile(
             depth=1,
             reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.map_pub = self.create_publisher(
-            OccupancyGridMsg,
-            str(self.get_parameter('map_topic').value),
-            latched_qos,
-        )
+            OccupancyGridMsg, g('map_topic'), latched)
 
-        # ---- timers --------------------------------------------------
-        self.create_timer(
-            1.0 / float(self.get_parameter('process_rate_hz').value),
-            self._tick,
-        )
-        self.create_timer(
-            1.0 / float(self.get_parameter('publish_rate_hz').value),
-            self._publish_map,
-        )
+        self.create_timer(1.0 / float(g('process_rate_hz')), self._tick)
+        self.create_timer(1.0 / float(g('publish_rate_hz')), self._publish_map)
 
         self._has_data = False
         self.get_logger().info(
-            f'mapper_node ready. '
-            f'grid={spec.width_m}x{spec.height_m} m '
-            f'@ {spec.resolution} m/cell ({self.grid.cols}x{self.grid.rows}); '
-            f'max_range={self.max_range:.2f} m; '
-            f'pose source = sim direct ({robot_alias})'
-        )
+            f'ready; grid={spec.width_m}×{spec.height_m} m '
+            f'@ {spec.resolution} m/cell, max_range={self.max_range:.2f} m')
 
-    # ===== one-shot setup =================================================
+    # ===== one-shot setup ============================================
 
     def _publish_world_to_odom_tf(self) -> None:
-        """Bridge the sim's ``world`` frame into the robomaster_ros TF tree.
-
-        robomaster_ros publishes /odom and tf as ``odom -> ... ->
-        chassis_base_link``, with odom initialised at the robot's pose
-        when the driver started. We're starting now and the robot has
-        not moved yet, so the world→odom transform is just the robot's
-        current world pose (xy + yaw).
-        """
-        try:
-            mat = self.sim.getObjectMatrix(self.robot_handle, -1)
-        except Exception as e:
-            self.get_logger().warn(
-                f'Could not read robot pose for world->odom TF: {e}')
-            return
+        """Bridge the sim ``world`` frame into the robomaster_ros TF
+        tree. The driver initialises ``odom`` at the robot's pose at
+        startup, so world→odom is just that pose (xy + yaw)."""
+        mat = self.sim.getObjectMatrix(self.robot_handle, -1)
 
         self._static_tf = StaticTransformBroadcaster(self)
         t = TransformStamped()
@@ -177,94 +144,49 @@ class MapperNode(Node):
         t.transform.rotation.w = math.cos(yaw / 2.0)
         self._static_tf.sendTransform(t)
         self.get_logger().info(
-            f'Published static TF world -> odom @ '
-            f'({mat[3]:.2f}, {mat[7]:.2f}, yaw={math.degrees(yaw):.1f}°)'
-        )
+            f'world→odom @ ({mat[3]:.2f}, {mat[7]:.2f}, '
+            f'yaw={math.degrees(yaw):.1f}°)')
 
     def _enumerate_obstacles(self) -> list[dict]:
-        """List Wall*/Obstacle_*/Door/PressurePlate objects with their
-        world-axis-aligned XY bounding box. Cached in
-        ``self.obstacle_specs`` once at init: only handle + local bbox
-        extents (which never change). Per-tick world AABBs are
-        recomputed in ``_refresh_obstacle_aabbs`` from current sim
-        position/yaw."""
+        """Once at init: list obstacle handles and their local bbox
+        extents (which never change)."""
         sim = self.sim
         out: list[dict] = []
         for handle in sim.getObjectsInTree(sim.handle_scene):
-            try:
-                alias = sim.getObjectAlias(handle, 0)
-            except Exception:
-                continue
+            alias = sim.getObjectAlias(handle, 0)
             if not alias.startswith(_OBSTACLE_PREFIXES):
                 continue
-            try:
-                x0 = sim.getObjectFloatParam(
-                    handle, sim.objfloatparam_objbbox_min_x)
-                y0 = sim.getObjectFloatParam(
-                    handle, sim.objfloatparam_objbbox_min_y)
-                x1 = sim.getObjectFloatParam(
-                    handle, sim.objfloatparam_objbbox_max_x)
-                y1 = sim.getObjectFloatParam(
-                    handle, sim.objfloatparam_objbbox_max_y)
-            except Exception as e:
-                self.get_logger().warn(
-                    f"Could not read local bbox for '{alias}': {e}")
-                continue
+            extents = (
+                sim.getObjectFloatParam(handle, sim.objfloatparam_objbbox_min_x),
+                sim.getObjectFloatParam(handle, sim.objfloatparam_objbbox_min_y),
+                sim.getObjectFloatParam(handle, sim.objfloatparam_objbbox_max_x),
+                sim.getObjectFloatParam(handle, sim.objfloatparam_objbbox_max_y),
+            )
             out.append({'handle': int(handle), 'alias': alias,
-                        'extents': (x0, y0, x1, y1)})
+                        'extents': extents})
         return out
 
     def _refresh_obstacle_aabbs(self) -> list[dict]:
-        """Re-query each cached obstacle's world position + yaw and
-        rebuild its world XY AABB. Objects whose Z drops below the
-        floor (e.g. the door, which slides under after opening) are
-        filtered out so they no longer block A*. Returned list is
-        consumed by ``_compute_obstacle_mask``."""
+        """Per tick: rebuild each obstacle's world XY AABB from current
+        sim pose. Objects below the floor (e.g. the open door) are
+        skipped so they no longer block A*."""
         out: list[dict] = []
         for spec in self.obstacle_specs:
-            try:
-                pos = self.sim.getObjectPosition(spec['handle'], -1)
-            except Exception:
+            pos = self.sim.getObjectPosition(spec['handle'], -1)
+            if pos[2] < _BELOW_FLOOR_Z:
                 continue
-            # The door slides to negative Z when opened; treat it as
-            # not-an-obstacle in that case so cells underneath become
-            # navigable.
-            if pos[2] < -0.05:
-                continue
-            try:
-                yaw = self.sim.getObjectOrientation(spec['handle'], -1)[2]
-            except Exception:
-                continue
+            yaw = self.sim.getObjectOrientation(spec['handle'], -1)[2]
             x0, y0, x1, y1 = spec['extents']
             c, s = math.cos(yaw), math.sin(yaw)
-            local_corners = ((x0, y0), (x0, y1), (x1, y0), (x1, y1))
-            wx = [pos[0] + c * x - s * y for x, y in local_corners]
-            wy = [pos[1] + s * x + c * y for x, y in local_corners]
+            corners = ((x0, y0), (x0, y1), (x1, y0), (x1, y1))
+            wx = [pos[0] + c * x - s * y for x, y in corners]
+            wy = [pos[1] + s * x + c * y for x, y in corners]
             out.append({'alias': spec['alias'],
                         'aabb': (min(wx), min(wy), max(wx), max(wy))})
         return out
 
-    def _world_xy_aabb(self, handle: int
-                       ) -> tuple[float, float, float, float]:
-        """World-frame XY axis-aligned bounding box for an object,
-        accounting for its yaw. Exact for axis-aligned cuboids and
-        cylinders — the only primitives build_scene.py creates."""
-        sim = self.sim
-        pos = sim.getObjectPosition(handle, -1)
-        yaw = sim.getObjectOrientation(handle, -1)[2]
-        x0 = sim.getObjectFloatParam(handle, sim.objfloatparam_objbbox_min_x)
-        y0 = sim.getObjectFloatParam(handle, sim.objfloatparam_objbbox_min_y)
-        x1 = sim.getObjectFloatParam(handle, sim.objfloatparam_objbbox_max_x)
-        y1 = sim.getObjectFloatParam(handle, sim.objfloatparam_objbbox_max_y)
-        c, s = math.cos(yaw), math.sin(yaw)
-        local_corners = [(x0, y0), (x0, y1), (x1, y0), (x1, y1)]
-        wx = [pos[0] + c * x - s * y for x, y in local_corners]
-        wy = [pos[1] + s * x + c * y for x, y in local_corners]
-        return min(wx), min(wy), max(wx), max(wy)
-
-    def _grid_cell_centers(self, spec: GridSpec
+    def _grid_cell_centres(self, spec: GridSpec
                            ) -> tuple[np.ndarray, np.ndarray]:
-        """World XY of every cell center, returned as (rows, cols) arrays."""
         cols = np.arange(self.grid.cols)
         rows = np.arange(self.grid.rows)
         cx = spec.origin_x + (cols + 0.5) * spec.resolution
@@ -273,31 +195,21 @@ class MapperNode(Node):
         return cell_x.astype(np.float32), cell_y.astype(np.float32)
 
     def _compute_obstacle_mask(self) -> np.ndarray:
-        """Boolean (rows, cols) mask: True where a cell center lies
-        inside any obstacle's world AABB."""
+        """True where the cell centre lies inside any obstacle AABB."""
         mask = np.zeros((self.grid.rows, self.grid.cols), dtype=bool)
         for obs in self.obstacles:
             xmin, ymin, xmax, ymax = obs['aabb']
-            inside = ((self._cell_x >= xmin) & (self._cell_x <= xmax) &
-                      (self._cell_y >= ymin) & (self._cell_y <= ymax))
-            mask |= inside
+            mask |= ((self._cell_x >= xmin) & (self._cell_x <= xmax) &
+                     (self._cell_y >= ymin) & (self._cell_y <= ymax))
         return mask
 
-    # ===== per-tick virtual scan ==========================================
+    # ===== per-tick virtual scan =====================================
 
     def _tick(self) -> None:
-        try:
-            mat = self.sim.getObjectMatrix(self.robot_handle, -1)
-        except Exception as e:
-            self.get_logger().warn(
-                f'sim.getObjectMatrix failed: {e}',
-                throttle_duration_sec=2.0,
-            )
-            return
+        mat = self.sim.getObjectMatrix(self.robot_handle, -1)
         rx, ry = float(mat[3]), float(mat[7])
-        # Re-poll obstacle positions: the door slides under the floor
-        # when opened and must drop out of the obstacle mask so A* can
-        # plan through.
+        # Re-poll obstacle poses every tick (door slides underground
+        # when opened) and rebuild the mask from the survivors.
         self.obstacles = self._refresh_obstacle_aabbs()
         self._obstacle_mask = self._compute_obstacle_mask()
         self._virtual_scan(rx, ry)
@@ -306,21 +218,13 @@ class MapperNode(Node):
     def _virtual_scan(self, rx: float, ry: float) -> None:
         """Cast ``scan_rays`` rays from the robot through the obstacle
         mask. Cells along each ray become FREE up to the first
-        obstacle (which becomes OCC). Cells beyond ``max_range`` or
-        behind an obstacle stay UNKNOWN — that's how movement-driven
-        discovery is preserved.
-
-        When a ray passes through a cell that is no longer in the
-        obstacle mask but used to be marked OCC (e.g. the wall cells
-        the door used to occupy, after the door slides under the
-        floor), we also CLEAR ``occ`` for that cell. This is what
-        lets A* plan through the door once it's open."""
+        obstacle (which becomes OCC). When a ray passes through a cell
+        that is no longer in the mask, OCC is also cleared so A* can
+        plan through openings the door used to block."""
         spec = self.grid.spec
         res = spec.resolution
         max_steps = int(math.ceil(self.max_range / res))
-        n_rays = self._ray_dx.shape[0]
 
-        # Pre-compute (col, row) along every ray, every step.
         steps = (np.arange(1, max_steps + 1) * res).astype(np.float32)
         wx = rx + np.outer(self._ray_dx, steps)
         wy = ry + np.outer(self._ray_dy, steps)
@@ -333,10 +237,9 @@ class MapperNode(Node):
         occ = self.grid.occ
         obstacle = self._obstacle_mask
 
-        # The early-exit on each ray is what makes occlusion behave
-        # correctly; vectorising this requires a bit of trickery and
-        # the loop is fast enough at 5 Hz on this 100×100 grid.
-        for r in range(n_rays):
+        # Per-ray loop: vectorising the early-exit on hit isn't
+        # worth the complexity at 5 Hz on a 100×100 grid.
+        for r in range(self._ray_dx.shape[0]):
             for s in range(max_steps):
                 if not in_bounds[r, s]:
                     break
@@ -346,17 +249,14 @@ class MapperNode(Node):
                     occ[rr, c] = True
                     break
                 free[rr, c] = True
-                # If a ray passes through a cell, the cell is empty
-                # right now — clear any stale OCC from when an
-                # obstacle (e.g. the now-open door) was there.
                 occ[rr, c] = False
 
-        # The robot's own cell is observed-free.
+        # The robot's own cell is always observed-free.
         rcol, rrow = self.grid.world_to_grid(rx, ry)
         if self.grid.in_bounds(rcol, rrow):
             free[rrow, rcol] = True
 
-    # ===== publishing =====================================================
+    # ===== publishing ================================================
 
     def _publish_map(self) -> None:
         if not self._has_data:
@@ -378,15 +278,13 @@ class MapperNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = None
+    node = MapperNode()
     try:
-        node = MapperNode()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        if node is not None:
-            node.destroy_node()
+        node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 

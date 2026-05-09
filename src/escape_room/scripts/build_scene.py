@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""
-Builds an escape-room scene in CoppeliaSim from a JSON scenario file.
+"""Build an escape-room scene in CoppeliaSim from a JSON scenario.
 
 Usage:
     pixi shell
     python src/escape_room/scripts/build_scene.py src/escape_room/scenarios/easy.json
 """
+from __future__ import annotations
 
 import json
 import math
@@ -15,414 +15,314 @@ from pathlib import Path
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
 
-def make_shape(
-    sim,
-    prim_type,
-    size,
-    center,
-    color=(0.7, 0.7, 0.7),
-    name=None,
-    static=True,
-    respondable=True,
-):
-    """Create a primitive shape and place it. Sizes are full extents in meters.
-    Center is the shape's center in world coordinates (CoppeliaSim convention).
-    """
+# Lua snippet appended to the gripper child script. The escape-room
+# code drives the gripper from outside CoppeliaSim, but the model's
+# script communicates with itself via ``sim.setInt32Signal`` /
+# ``sim.getInt32Signal`` — and signals are scoped per-script context
+# in modern CoppeliaSim, so external writes are invisible. The
+# wrappers below intercept the signal API in the script's own
+# environment and back the two state signals with Lua globals, which
+# all callbacks of this script (sysCall_init, sysCall_actuation, and
+# the ``_ext_*`` helpers we call from Python) can share.
+_GRIPPER_HELPERS_LUA = """
+-- ===== EXT GRIPPER CONTROL (injected) =====
+_ext_target_state = 0
+_ext_current_state = 0
+local _ext_orig_set = sim.setInt32Signal
+local _ext_orig_get = sim.getInt32Signal
+sim.setInt32Signal = function(name, val)
+  if name == target_state_signal then _ext_target_state = val
+  elseif name == current_state_signal then _ext_current_state = val
+  else _ext_orig_set(name, val) end
+end
+sim.getInt32Signal = function(name)
+  if name == target_state_signal then return _ext_target_state end
+  if name == current_state_signal then return _ext_current_state end
+  return _ext_orig_get(name)
+end
+function _ext_set_target(state_int) _ext_target_state = state_int end
+function _ext_get_state() return _ext_current_state end
+"""
+
+_PRIM_TYPE = {'box': 'cuboid', 'cylinder': 'cylinder'}
+
+_MANAGED_PREFIXES = (
+    'Wall', 'Door', 'Obstacle_', 'TargetCube', 'PressurePlate',
+    'RoboMasterEP', 'RoboMasterS1',
+)
+
+
+# ---- primitives -----------------------------------------------------
+
+def make_shape(sim, prim_type, size, center, *, color, name,
+               static=True, respondable=True):
     handle = sim.createPrimitiveShape(prim_type, list(size), 0)
-
-    if handle is None or handle < 0:
-        raise RuntimeError(f"createPrimitiveShape returned invalid handle: {handle}")
-
     sim.setObjectPosition(handle, list(center), -1)
-    sim.setShapeColor(handle, "", sim.colorcomponent_ambient_diffuse, list(color))
-    sim.setObjectInt32Param(handle, sim.shapeintparam_static, 1 if static else 0)
+    sim.setShapeColor(
+        handle, '', sim.colorcomponent_ambient_diffuse, list(color))
     sim.setObjectInt32Param(
-        handle, sim.shapeintparam_respondable, 1 if respondable else 0
-    )
-    if name:
-        sim.setObjectAlias(handle, name)
+        handle, sim.shapeintparam_static, 1 if static else 0)
+    sim.setObjectInt32Param(
+        handle, sim.shapeintparam_respondable, 1 if respondable else 0)
+    sim.setObjectAlias(handle, name)
     return handle
 
 
-def _segments_around_doors(wall_length, door_centers):
-    """Return the solid wall segments that remain after cutting out door openings.
+# ---- walls and doors ------------------------------------------------
 
-    All coordinates are relative to the wall's center (positive = right).
-    The wall spans [-wall_length/2, +wall_length/2].
+def _segments_around_doors(wall_length, doors):
+    """Solid wall segments left after cutting out door openings.
 
-    door_centers: list of (door_center, door_width), both relative to wall center.
-    Returns [(seg_length, seg_center), ...] sorted left-to-right, also relative
-    to wall center.
+    Coordinates are along the wall, relative to the wall's centre.
+    ``doors`` is a list of (centre_offset, width). Returns
+    [(seg_length, seg_centre), ...] left-to-right.
     """
     half = wall_length / 2
-    # Sort doors left-to-right by their left edge so the sweep works in one pass.
-    sorted_doors = sorted(door_centers, key=lambda d: d[0] - d[1] / 2)
+    sorted_doors = sorted(doors, key=lambda d: d[0] - d[1] / 2)
     segments = []
-    # x is a cursor that starts at the wall's left edge and advances to each
-    # door's right edge, marking the start of the next potential solid segment.
-    x = -half
-    for door_center, door_w in sorted_doors:
-        door_l = door_center - door_w / 2  # left edge of this door
-        door_r = door_center + door_w / 2  # right edge of this door
-        if door_l < -half or door_r > half:
+    cursor = -half
+    for centre, width in sorted_doors:
+        left = centre - width / 2
+        right = centre + width / 2
+        if left < -half or right > half:
             raise ValueError(
-                f"Door (center={door_center:.3f}, width={door_w:.3f}) "
-                f"exceeds wall bounds [{-half:.3f}, {half:.3f}]."
-            )
-        if door_l <= x:
+                f'Door (centre={centre:.3f}, width={width:.3f}) '
+                f'exceeds wall bounds [{-half:.3f}, {half:.3f}]')
+        if left <= cursor:
             raise ValueError(
-                f"Door (center={door_center:.3f}, width={door_w:.3f}) "
-                f"overlaps or is adjacent to the previous door (ends at {x:.3f})."
-            )
-        # Solid segment from x to door_l; its center is their midpoint.
-        segments.append((door_l - x, (x + door_l) / 2))
-        x = door_r
-    # Solid segment from last door's right edge to the wall's right edge.
-    if x < half:
-        segments.append((half - x, (x + half) / 2))
+                f'Door (centre={centre:.3f}, width={width:.3f}) '
+                f'overlaps the previous door (ends at {cursor:.3f})')
+        segments.append((left - cursor, (cursor + left) / 2))
+        cursor = right
+    if cursor < half:
+        segments.append((half - cursor, (cursor + half) / 2))
     return segments
 
 
+def _wall_layout(width, length, thickness):
+    """Per-wall geometry: (axis, length, centre_x, centre_y, alias).
 
-def build_walls(sim, room_cfg):
-    width = room_cfg["width"]
-    length = room_cfg["length"]
-    height = room_cfg["height"]
-    thickness = room_cfg["wall_thickness"]
+    wall_side index follows the layout order: 0=North, 1=East,
+    2=South, 3=West (matches scenario JSON).
+    """
     hw, hl = width / 2, length / 2
-    doors = room_cfg.get("doors", [])
-
-    # (wall_side, axis, full_wall_length, center_x, center_y, alias_prefix)
-    # N/S walls extend past corners (+2*thickness); E/W walls span the interior only.
-    walls = [
-        ("x", width + 2 * thickness, 0.0, hl + thickness / 2, "WallNorth"),
-        ("y", length, hw + thickness / 2, 0.0, "WallEast"),
-        ("x", width + 2 * thickness, 0.0, -(hl + thickness / 2), "WallSouth"),
-        ("y", length, -(hw + thickness / 2), 0.0, "WallWest"),
+    return [
+        ('x', width + 2 * thickness, 0.0,  hl + thickness / 2, 'WallNorth'),
+        ('y', length,                 hw + thickness / 2, 0.0, 'WallEast'),
+        ('x', width + 2 * thickness, 0.0, -hl - thickness / 2, 'WallSouth'),
+        ('y', length,                -hw - thickness / 2, 0.0, 'WallWest'),
     ]
 
-    handles = []
-    for wall_side, (axis, wall_len, center_x, center_y, alias) in enumerate(walls):
-        doors = [d for d in doors if d["wall_side"] == wall_side]
-        door_centers = [(d["center_offset"], d["width"]) for d in doors]
 
-        for seg_idx, (seg_len, seg_center) in enumerate(
-            _segments_around_doors(wall_len, door_centers)
-        ):
-            if axis == "x":
+def build_walls(sim, room_cfg):
+    width = room_cfg['width']
+    length = room_cfg['length']
+    height = room_cfg['height']
+    thickness = room_cfg['wall_thickness']
+    all_doors = room_cfg.get('doors', [])
+
+    for wall_side, (axis, wall_len, cx, cy, alias) in enumerate(
+            _wall_layout(width, length, thickness)):
+        wall_doors = [(d['center_offset'], d['width'])
+                      for d in all_doors if d['wall_side'] == wall_side]
+        for i, (seg_len, seg_off) in enumerate(
+                _segments_around_doors(wall_len, wall_doors)):
+            if axis == 'x':
                 size = (seg_len, thickness, height)
-                seg_center_x, seg_center_y = center_x + seg_center, center_y
+                pos = (cx + seg_off, cy, height / 2)
             else:
                 size = (thickness, seg_len, height)
-                seg_center_x, seg_center_y = center_x, center_y + seg_center
-
-            handle = make_shape(
-                sim,
-                getattr(sim, "primitiveshape_cuboid"),
-                size,
-                (seg_center_x, seg_center_y, height / 2),
-                color=(0.85, 0.85, 0.85),
-                name=f"{alias}_{seg_idx}",
-            )
+                pos = (cx, cy + seg_off, height / 2)
+            h = make_shape(
+                sim, sim.primitiveshape_cuboid, size, pos,
+                color=(0.85, 0.85, 0.85), name=f'{alias}_{i}')
             sim.setObjectSpecialProperty(
-                handle, sim.objectspecialproperty_detectable_all
-            )
-            handles.append(handle)
-    return handles
+                h, sim.objectspecialproperty_detectable_all)
 
 
-def build_door(sim, room_cfg, door_cfg, door_idx):
-    """Place a door panel that fills the gap left in one of the room walls."""
-    width = room_cfg["width"]
-    length = room_cfg["length"]
-    thickness = room_cfg["wall_thickness"]
-    height = room_cfg["height"]
+def build_door(sim, room_cfg, door_cfg, idx):
+    """Place a door panel that fills the gap left in one wall."""
+    width = room_cfg['width']
+    length = room_cfg['length']
+    thickness = room_cfg['wall_thickness']
+    height = room_cfg['height']
     hw, hl = width / 2, length / 2
 
-    wall_side = door_cfg["wall_side"]
-    door_w = door_cfg["width"]
-    color = door_cfg.get("color", (0.55, 0.30, 0.15))
+    side = door_cfg['wall_side']
+    door_w = door_cfg['width']
+    centre = door_cfg['center_offset']
+    color = door_cfg.get('color', (0.55, 0.30, 0.15))
 
-    door_center = door_cfg["center_offset"]
-
-    if wall_side == 0:
-        size = (door_w, thickness, height)
-        center_x, center_y = door_center, hl + thickness / 2
-    elif wall_side == 1:
-        size = (thickness, door_w, height)
-        center_x, center_y = hw + thickness / 2, door_center
-    elif wall_side == 2:
-        size = (door_w, thickness, height)
-        center_x, center_y = door_center, -(hl + thickness / 2)
-    elif wall_side == 3:
-        size = (thickness, door_w, height)
-        center_x, center_y = -(hw + thickness / 2), door_center
+    if side == 0:    # North
+        size, pos = (door_w, thickness, height), (centre,  hl + thickness / 2, height / 2)
+    elif side == 1:  # East
+        size, pos = (thickness, door_w, height), (hw + thickness / 2, centre, height / 2)
+    elif side == 2:  # South
+        size, pos = (door_w, thickness, height), (centre, -hl - thickness / 2, height / 2)
+    elif side == 3:  # West
+        size, pos = (thickness, door_w, height), (-hw - thickness / 2, centre, height / 2)
     else:
-        raise ValueError(f"Unknown wall_side: {wall_side}")
+        raise ValueError(f'unknown wall_side {side}')
 
-    handle = make_shape(
-        sim,
-        getattr(sim, "primitiveshape_cuboid"),
-        size,
-        (center_x, center_y, height / 2),
-        color=color,
-        name=f"Door_{door_idx}",
-        static=True,
-        respondable=True,
-    )
-    sim.setObjectSpecialProperty(handle, sim.objectspecialproperty_detectable_all)
-    return handle
-
-
-_PRIM_TYPE = {"box": "cuboid", "cylinder": "cylinder"}
-
-
-def build_obstacle(sim, obs, idx):
-    color = obs.get("color", (0.4, 0.4, 0.5))
-    prim = getattr(sim, f"primitiveshape_{_PRIM_TYPE[obs['type']]}")
-    handle = make_shape(
-        sim,
-        prim,
-        obs["size"],
-        obs["position"],
-        color=color,
-        name=f"Obstacle_{idx}",
-    )
-    sim.setObjectSpecialProperty(handle, sim.objectspecialproperty_detectable_all)
-    return handle
-
-
-def build_target_key(sim, cfg):
-    """Place the "key" the robot must grasp and move.
-
-    A tall thin cylinder, much easier for the RoboMaster gripper to
-    pick up than a low cube. ``cfg["size"]`` is [diameter, diameter,
-    height] in metres.
-    """
-    handle = make_shape(
-        sim,
-        getattr(sim, "primitiveshape_cylinder"),
-        cfg["size"],
-        cfg["position"],
-        color=cfg.get("color", (0.9, 0.2, 0.2)),
-        name="TargetCube",
-        static=False,
-    )
-    sim.setObjectSpecialProperty(handle, sim.objectspecialproperty_detectable_all)
-    sim.setObjectInt32Param(handle, sim.shapeintparam_static, 0)
-    return handle
-
-
-def build_pressure_plate(sim, cfg):
     h = make_shape(
-        sim,
-        getattr(sim, "primitiveshape_cuboid"),
-        cfg["size"],
-        cfg["position"],
-        color=cfg.get("color", (0.2, 0.6, 0.9)),
-        name="PressurePlate",
-        static=True,
-        respondable=False,
-    )
+        sim, sim.primitiveshape_cuboid, size, pos,
+        color=color, name=f'Door_{idx}')
+    sim.setObjectSpecialProperty(h, sim.objectspecialproperty_detectable_all)
     return h
 
 
+# ---- obstacles, target, plate ---------------------------------------
+
+def build_obstacle(sim, obs, idx):
+    prim = getattr(sim, f'primitiveshape_{_PRIM_TYPE[obs["type"]]}')
+    h = make_shape(
+        sim, prim, obs['size'], obs['position'],
+        color=obs.get('color', (0.4, 0.4, 0.5)),
+        name=f'Obstacle_{idx}')
+    sim.setObjectSpecialProperty(h, sim.objectspecialproperty_detectable_all)
+    return h
+
+
+def build_target_cube(sim, cfg):
+    """The "key" the robot must grasp. A tall thin cylinder is much
+    easier for the gripper to pick up than a flat cube."""
+    h = make_shape(
+        sim, sim.primitiveshape_cylinder, cfg['size'], cfg['position'],
+        color=cfg.get('color', (0.9, 0.2, 0.9)),
+        name='TargetCube', static=False)
+    sim.setObjectSpecialProperty(h, sim.objectspecialproperty_detectable_all)
+    return h
+
+
+def build_pressure_plate(sim, cfg):
+    return make_shape(
+        sim, sim.primitiveshape_cuboid, cfg['size'], cfg['position'],
+        color=cfg.get('color', (0.1, 0.8, 0.2)),
+        name='PressurePlate', static=True, respondable=False)
+
+
+# ---- robot ----------------------------------------------------------
+
+def _resolve_model_path(robot_cfg, sim):
+    explicit = robot_cfg.get('model_path')
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f'robot model not found: {path}')
+        return str(path)
+    coppelia_root = sim.getStringParam(sim.stringparam_scenedefaultdir)
+    return f'{coppelia_root}/../models/robots/mobile/{robot_cfg["model"]}.ttm'
+
+
+def _inject_gripper_helpers(sim, robot_h, model_name):
+    """Append the Lua signal-shim + ``_ext_*`` helpers to the gripper
+    script. Idempotent: re-running the builder doesn't duplicate."""
+    gripper_h = next(
+        (int(h) for h in sim.getObjectsInTree(robot_h)
+         if sim.getObjectAlias(int(h), 0) == 'gripper_link_respondable'),
+        None,
+    )
+    if gripper_h is None:
+        raise RuntimeError(
+            f'gripper_link_respondable not found in {model_name}')
+    script_h = sim.getScript(1, gripper_h)   # 1 = child script
+    src = sim.getScriptStringParam(script_h, sim.scriptstringparam_text)
+    if 'function _ext_set_target' in src:
+        return
+    sim.setScriptStringParam(
+        script_h, sim.scriptstringparam_text, src + _GRIPPER_HELPERS_LUA)
+    print(f'[builder] injected gripper helpers into {model_name} script')
+
+
 def load_robot(sim, robot_cfg):
-    """Load a RoboMaster model preserving its natural pose offsets.
-
-    Resolution order for the model file:
-      1. robot_cfg['model_path'] — explicit path (absolute, or relative to cwd)
-      2. <coppelia models>/robots/mobile/<robot_cfg['model']>.ttm — fallback
-    The in-scene alias is always robot_cfg['model'] so downstream code
-    (clear_scene, robomaster_ros TF chain) stays stable.
-    """
-    model_name = robot_cfg.get("model", "RoboMasterEP")
-    explicit_path = robot_cfg.get("model_path")
-
-    if explicit_path:
-        model_path = str(Path(explicit_path).expanduser().resolve())
-        if not Path(model_path).is_file():
-            raise FileNotFoundError(f"Robot model not found: {model_path}")
-    else:
-        coppelia_root = sim.getStringParam(sim.stringparam_scenedefaultdir)
-        model_path = f"{coppelia_root}/../models/robots/mobile/{model_name}.ttm"
+    """Load a RoboMaster model, place it, and inject the gripper
+    helpers needed by the explorer node. The in-scene alias is set
+    to ``robot_cfg['model']`` so downstream code can resolve it."""
+    model_name = robot_cfg.get('model', 'RoboMasterEP')
+    model_path = _resolve_model_path(robot_cfg, sim)
 
     handle = sim.loadModel(model_path)
     if handle < 0:
-        raise RuntimeError(f"loadModel failed for {model_path}")
+        raise RuntimeError(f'loadModel failed for {model_path}')
 
-    pos = robot_cfg["position"]
+    pos = robot_cfg['position']
     sim.setObjectPosition(handle, pos, -1)
 
-    orient = robot_cfg.get("orientation", [0, 0, 0])
+    rpy = robot_cfg.get('orientation', [0, 0, 0])
     m = sim.getObjectMatrix(handle, -1)
-    m = sim.rotateAroundAxis(m, [1, 0, 0], pos, math.radians(orient[0]))
-    m = sim.rotateAroundAxis(m, [0, 1, 0], pos, math.radians(orient[1]))
-    m = sim.rotateAroundAxis(m, [0, 0, 1], pos, math.radians(orient[2]))
+    m = sim.rotateAroundAxis(m, [1, 0, 0], pos, math.radians(rpy[0]))
+    m = sim.rotateAroundAxis(m, [0, 1, 0], pos, math.radians(rpy[1]))
+    m = sim.rotateAroundAxis(m, [0, 0, 1], pos, math.radians(rpy[2]))
     sim.setObjectMatrix(handle, -1, m)
     sim.setObjectAlias(handle, model_name)
 
-    # Reset physics for the whole model subtree to avoid teleport explosions
+    # Reset physics for the whole subtree so the teleport doesn't
+    # explode joints with built-up momentum.
     for h in sim.getObjectsInTree(handle):
-        try:
-            sim.resetDynamicObject(h)
-        except Exception:
-            pass
+        sim.resetDynamicObject(h)
 
-    # Inject Lua wrappers into the gripper_link_respondable child
-    # script so external Python code (explorer_node) can drive the
-    # gripper. The CoppeliaSim signal API is unreliable across
-    # contexts in modern versions, so we monkey-patch
-    # ``sim.setInt32Signal`` / ``sim.getInt32Signal`` *inside this
-    # script's environment* to use a Lua-table backing store for the
-    # two state signals. That guarantees that the writes done by
-    # ``sysCall_init`` (line 55-56), the reads in ``sysCall_actuation``
-    # (line 146-147) and our external setters all share the same
-    # storage. ``_ext_diag`` returns a string with the script's
-    # internal state for debugging.
-    helpers = (
-        '\n-- ===== EXT GRIPPER CONTROL (injected) =====\n'
-        '_ext_target_state = 0\n'
-        '_ext_current_state = 0\n'
-        'local _ext_orig_set = sim.setInt32Signal\n'
-        'local _ext_orig_get = sim.getInt32Signal\n'
-        'sim.setInt32Signal = function(name, val)\n'
-        '  if name == target_state_signal then _ext_target_state = val\n'
-        '  elseif name == current_state_signal then _ext_current_state = val\n'
-        '  else _ext_orig_set(name, val) end\n'
-        'end\n'
-        'sim.getInt32Signal = function(name)\n'
-        '  if name == target_state_signal then return _ext_target_state end\n'
-        '  if name == current_state_signal then return _ext_current_state end\n'
-        '  return _ext_orig_get(name)\n'
-        'end\n'
-        'function _ext_set_target(state_int)\n'
-        '  _ext_target_state = state_int\n'
-        'end\n'
-        'function _ext_get_state()\n'
-        '  return _ext_current_state\n'
-        'end\n'
-        'function _ext_diag()\n'
-        '  return string.format(\n'
-        '    "tgt_sig=%s cur_sig=%s h=%s tgt=%s cur=%s pos=%s",\n'
-        '    tostring(target_state_signal),\n'
-        '    tostring(current_state_signal),\n'
-        '    tostring(h),\n'
-        '    tostring(_ext_target_state),\n'
-        '    tostring(_ext_current_state),\n'
-        '    tostring(h and sim.getJointPosition(h) or "nil"))\n'
-        'end\n'
-    )
-    try:
-        gripper_h = None
-        for h in sim.getObjectsInTree(handle):
-            try:
-                if (sim.getObjectAlias(int(h), 0)
-                        == 'gripper_link_respondable'):
-                    gripper_h = int(h)
-                    break
-            except Exception:
-                continue
-        if gripper_h is None:
-            print('[builder] WARN: gripper_link_respondable not found')
-        else:
-            script_h = sim.getScript(1, gripper_h)   # 1 = child script
-            if script_h and script_h > 0:
-                src = sim.getScriptStringParam(
-                    script_h, sim.scriptstringparam_text)
-                if 'function _ext_diag' not in src:
-                    sim.setScriptStringParam(
-                        script_h, sim.scriptstringparam_text, src + helpers)
-                    print('[builder] injected gripper helpers + signal '
-                          'shim into gripper_link_respondable child script')
-    except Exception as e:
-        print(f'[builder] WARN: gripper helpers injection failed: {e}')
-
+    _inject_gripper_helpers(sim, handle, model_name)
     return handle
 
 
+# ---- scene management ----------------------------------------------
+
 def clear_scene(sim):
-    """
-    Remove only objects we manage (walls, obstacles, target cube, plate, robot).
-    Identified by alias prefix. Leaves the default Coppelia scene (floor,
-    cameras, lights) untouched.
-    """
-    managed_prefixes = (
-        "Wall",
-        "Obstacle_",
-        "TargetCube",
-        "PressurePlate",
-        "Door",
-        "RoboMasterEP",
-        "RoboMasterS1",
-    )
-    handles_to_remove = []
-    for handle in sim.getObjectsInTree(sim.handle_scene):
-        try:
-            alias = sim.getObjectAlias(handle, 0)
-        except Exception:
-            continue
-        if alias.startswith(managed_prefixes):
-            handles_to_remove.append(handle)
-    if handles_to_remove:
-        try:
-            sim.removeObjects(handles_to_remove)
-            print(f"[builder] Removed {len(handles_to_remove)} managed objects.")
-        except Exception as e:
-            print(f"[builder] clear_scene warning: {e}")
+    """Remove only objects we manage (walls, obstacles, key, plate,
+    door, robot). Default Coppelia floor / cameras / lights stay."""
+    to_remove = [
+        h for h in sim.getObjectsInTree(sim.handle_scene)
+        if sim.getObjectAlias(h, 0).startswith(_MANAGED_PREFIXES)
+    ]
+    if to_remove:
+        sim.removeObjects(to_remove)
+        print(f'[builder] removed {len(to_remove)} managed object(s)')
 
 
-def main(scenario_path: str):
+def main(scenario_path: str) -> None:
     cfg = json.loads(Path(scenario_path).read_text())
 
-    print("[builder] Connecting to CoppeliaSim...")
-    client = RemoteAPIClient()
-    sim = client.require("sim")
+    print('[builder] connecting to CoppeliaSim...')
+    sim = RemoteAPIClient().require('sim')
 
     if sim.getSimulationState() != sim.simulation_stopped:
-        print("[builder] Stopping running simulation...")
+        print('[builder] stopping running simulation...')
         sim.stopSimulation()
         while sim.getSimulationState() != sim.simulation_stopped:
             pass
 
-    print("[builder] Clearing scene...")
     clear_scene(sim)
 
-    room = cfg["room"]
-    doors = room.get("doors", [])
-
-    print("[builder] Building walls...")
+    room = cfg['room']
+    print('[builder] building walls...')
     build_walls(sim, room)
 
-    for i, door_cfg in enumerate(doors):
-        print(f"[builder] Placing door {i} on wall_side {door_cfg['wall_side']}...")
+    for i, door_cfg in enumerate(room.get('doors', [])):
+        print(f"[builder] placing door {i} on wall_side {door_cfg['wall_side']}")
         build_door(sim, room, door_cfg, i)
 
-    print(f"[builder] Building {len(cfg.get('obstacles', []))} obstacles...")
-    for i, obs in enumerate(cfg.get("obstacles", [])):
+    obstacles = cfg.get('obstacles', [])
+    print(f'[builder] building {len(obstacles)} obstacle(s)...')
+    for i, obs in enumerate(obstacles):
         build_obstacle(sim, obs, i)
 
-    if "target_cube" in cfg:
-        print("[builder] Placing target cube...")
-        build_target_key(sim, cfg["target_cube"])
+    if 'target_cube' in cfg:
+        print('[builder] placing target cube...')
+        build_target_cube(sim, cfg['target_cube'])
 
-    if "pressure_plate" in cfg:
-        print("[builder] Placing pressure plate...")
-        build_pressure_plate(sim, cfg["pressure_plate"])
+    if 'pressure_plate' in cfg:
+        print('[builder] placing pressure plate...')
+        build_pressure_plate(sim, cfg['pressure_plate'])
 
-    if "robot" in cfg:
-        print(f"[builder] Loading robot: {cfg['robot']['model']}...")
-        try:
-            load_robot(sim, cfg["robot"])
-        except Exception as e:
-            print(f"[builder] WARNING: could not load robot model: {e}")
-            print("[builder] Drag the robot from the model browser manually for now.")
+    if 'robot' in cfg:
+        print(f"[builder] loading robot {cfg['robot']['model']}...")
+        load_robot(sim, cfg['robot'])
 
-    print("[builder] Done. Scene ready.")
+    print('[builder] done. Scene ready.')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     if len(sys.argv) < 2:
-        print("Usage: build_scene.py <scenario.json>")
+        print('Usage: build_scene.py <scenario.json>')
         sys.exit(1)
     main(sys.argv[1])

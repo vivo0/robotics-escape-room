@@ -5,7 +5,7 @@ Looks for three coloured landmarks in the robot's camera image:
 
     cube  (magenta cuboid) → sim alias /TargetCube
     plate (green square)   → sim alias /PressurePlate
-    door  (blue rectangle) → sim alias /Door
+    door  (blue rectangle) → sim alias /Door_0
 
 The largest HSV-matching connected component is the detection. The
 first time a target clears its pixel threshold we publish:
@@ -70,7 +70,7 @@ _TARGETS: tuple[ColorTarget, ...] = (
                 [_hsv_range(140, 170)]),
     ColorTarget('plate', '/PressurePlate', 200, (0.1, 1.0, 0.1), 0.30,
                 [_hsv_range(40, 80)]),
-    ColorTarget('door',  '/Door',          300, (0.1, 0.3, 1.0), 0.80,
+    ColorTarget('door',  '/Door_0',        300, (0.1, 0.3, 1.0), 0.80,
                 [_hsv_range(100, 130)]),
 )
 
