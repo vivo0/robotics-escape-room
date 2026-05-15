@@ -22,7 +22,7 @@ from rclpy.node import Node
 
 from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import LaserScan
-from tf2_ros import StaticTransformBroadcaster
+from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
@@ -67,12 +67,14 @@ class LidarNode(Node):
         p('max_range',    5.0)
         p('laser_frame',  'laser')
         p('base_frame',   'base_link')
+        p('odom_frame',   'odom')
         p('laser_height', 0.12)
 
         g = lambda n: self.get_parameter(n).value
         self._max_range   = float(g('max_range'))
         self._laser_frame = str(g('laser_frame'))
         self._base_frame  = str(g('base_frame'))
+        self._odom_frame  = str(g('odom_frame'))
         self._laser_z     = float(g('laser_height'))
         n_rays            = int(g('n_rays'))
         rate              = float(g('scan_rate_hz'))
@@ -91,8 +93,9 @@ class LidarNode(Node):
         self.get_logger().info(
             f'found {len(self._obstacle_specs)} obstacle(s) in scene')
 
-        self._scan_pub = self.create_publisher(LaserScan, '/scan', 10)
+        self._scan_pub  = self.create_publisher(LaserScan, '/scan', 10)
         self._static_tf = StaticTransformBroadcaster(self)
+        self._tf_pub    = TransformBroadcaster(self)
         self._publish_static_tf()
 
         self.create_timer(1.0 / rate, self._tick)
@@ -126,6 +129,19 @@ class LidarNode(Node):
         t.transform.rotation.w    = 1.0
         self._static_tf.sendTransform(t)
 
+    def _publish_odom_tf(self, x: float, y: float, z: float,
+                         yaw: float) -> None:
+        t = TransformStamped()
+        t.header.stamp    = self.get_clock().now().to_msg()
+        t.header.frame_id = self._odom_frame
+        t.child_frame_id  = self._base_frame
+        t.transform.translation.x = x
+        t.transform.translation.y = y
+        t.transform.translation.z = z
+        t.transform.rotation.z = math.sin(yaw / 2.0)
+        t.transform.rotation.w = math.cos(yaw / 2.0)
+        self._tf_pub.sendTransform(t)
+
     # ===== per-tick =====================================================
 
     def _obstacle_aabbs(self) -> list[tuple[float, float, float, float]]:
@@ -146,9 +162,11 @@ class LidarNode(Node):
 
     def _tick(self) -> None:
         mat = self._sim.getObjectMatrix(self._robot_h, -1)
-        rx, ry = float(mat[3]), float(mat[7])
+        rx, ry, rz = float(mat[3]), float(mat[7]), float(mat[11])
+        yaw = math.atan2(float(mat[4]), float(mat[0]))
+        self._publish_odom_tf(rx, ry, rz, yaw)
 
-        aabbs   = self._obstacle_aabbs()
+        aabbs = self._obstacle_aabbs()
         max_r   = self._max_range
         ranges: list[float] = []
 
