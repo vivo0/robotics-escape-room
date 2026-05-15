@@ -80,7 +80,7 @@ class ColorDetectorNode(Node):
         super().__init__('color_detector_node')
 
         self.declare_parameter('image_topic', '/camera/image_color')
-        self.declare_parameter('target_frame', 'world')
+        self.declare_parameter('target_frame', 'odom')
         self.declare_parameter('camera_alias', '/RoboMasterEP/Camera')
         image_topic = str(self.get_parameter('image_topic').value)
         self.target_frame = str(self.get_parameter('target_frame').value)

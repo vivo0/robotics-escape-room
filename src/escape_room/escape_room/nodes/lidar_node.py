@@ -169,8 +169,12 @@ class LidarNode(Node):
         aabbs = self._obstacle_aabbs()
         max_r   = self._max_range
         ranges: list[float] = []
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
 
-        for dx, dy in zip(self._ray_dx, self._ray_dy):
+        for dx_laser, dy_laser in zip(self._ray_dx, self._ray_dy):
+            dx = cos_yaw * dx_laser - sin_yaw * dy_laser
+            dy = sin_yaw * dx_laser + cos_yaw * dy_laser
             d = max_r
             for xmin, ymin, xmax, ymax in aabbs:
                 hit = _ray_aabb_dist(rx, ry, dx, dy, xmin, ymin, xmax, ymax, d)
