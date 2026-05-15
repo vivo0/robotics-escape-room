@@ -2,7 +2,7 @@
 """Mission state machine for the escape room.
 
 Navigation is delegated to Nav2 (NavigateToPose action).  Exploration uses
-predefined boustrophedon waypoints instead of custom frontier detection.
+frontier detection on the live /map occupancy grid from slam_toolbox.
 Robot pose is read from the map→base_link TF published by slam_toolbox.
 
 Gripper control still uses the CoppeliaSim ZMQ API (Lua helpers injected by
@@ -29,7 +29,7 @@ from action_msgs.msg import GoalStatus
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 from geometry_msgs.msg import PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose
-from nav_msgs.msg import Path as PathMsg
+from nav_msgs.msg import OccupancyGrid, Path as PathMsg
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -40,18 +40,8 @@ from rclpy.time import Time
 GRIPPER_OPEN = 1
 GRIPPER_CLOSE = 2
 
-# Default boustrophedon coverage for easy.json (5×4 m room, walls at ±2.5/±2).
-_DEFAULT_WAYPOINTS = [
-    (-1.5, -1.5),
-    (0.0, -1.5),
-    (1.5, -1.5),
-    (1.5, 0.0),
-    (0.0, 0.0),
-    (-1.5, 0.0),
-    (-1.5, 1.5),
-    (0.0, 1.5),
-    (1.5, 1.5),
-]
+# Minimum frontier cluster size (cells) to filter noise in the occupancy grid.
+_MIN_FRONTIER_CELLS = 5
 
 
 def wrap_angle(a: float) -> float:
@@ -251,13 +241,13 @@ class ExplorerNode(Node):
                 lambda m, n=name: self._on_target(n, m),
                 latched,
             )
+        self.create_subscription(OccupancyGrid, "/map", self._on_map, latched)
 
         # ----- mission state -----------------------------------------
         self.targets: dict[str, tuple[float, float]] = {}
         self.mode = "explore"
         self.action_t = 0.0
-        self._coverage_wps = list(_DEFAULT_WAYPOINTS)
-        self._wp_idx = 0
+        self._current_map: OccupancyGrid | None = None
 
         self._handlers = {
             "explore": self._tick_navigate,
@@ -278,6 +268,9 @@ class ExplorerNode(Node):
         self.get_logger().info("ready; waiting for Nav2 and slam_toolbox...")
 
     # ===== ROS callbacks =============================================
+
+    def _on_map(self, msg: OccupancyGrid) -> None:
+        self._current_map = msg
 
     def _on_target(self, name: str, msg: PoseStamped) -> None:
         if name in self.targets:
@@ -304,7 +297,7 @@ class ExplorerNode(Node):
             if len(self.targets) == 3:
                 self._enter("go_to_key")
                 return
-            self._send_next_waypoint()
+            self._send_frontier_goal()
         elif self.mode == "go_to_key":
             self._begin_pickup()
         elif self.mode == "go_to_plate":
@@ -313,13 +306,72 @@ class ExplorerNode(Node):
             self._enter("done")
             self._stop()
 
-    def _send_next_waypoint(self) -> None:
-        if self._wp_idx >= len(self._coverage_wps):
-            self._wp_idx = 0
-        x, y = self._coverage_wps[self._wp_idx]
-        self._wp_idx += 1
-        self._publish_nav_goal_path(x, y)
-        self._nav.send(x, y)
+    def _send_frontier_goal(self) -> None:
+        """Navigate to the nearest unexplored frontier on the current map."""
+        if self._current_map is None:
+            return
+        frontiers = self._compute_frontiers(self._current_map)
+        if not frontiers:
+            self.get_logger().info("no frontiers; map fully explored")
+            return
+        pose = self._get_robot_pose()
+        if pose is None:
+            return
+        rx, ry, _ = pose
+        fx, fy = min(frontiers, key=lambda f: math.hypot(f[0] - rx, f[1] - ry))
+        self._publish_nav_goal_path(fx, fy)
+        self._nav.send(fx, fy)
+
+    def _compute_frontiers(
+        self, grid: OccupancyGrid
+    ) -> list[tuple[float, float]]:
+        """Return world-frame centroids of frontier clusters.
+
+        A frontier cell is a free cell (0) with at least one unknown (-1)
+        4-neighbour.  Adjacent frontier cells are merged into clusters; only
+        clusters with >= _MIN_FRONTIER_CELLS cells are returned.
+        """
+        w = grid.info.width
+        h = grid.info.height
+        data = grid.data
+        res = grid.info.resolution
+        ox = grid.info.origin.position.x
+        oy = grid.info.origin.position.y
+
+        frontier_set: set[tuple[int, int]] = set()
+        for r in range(1, h - 1):
+            for c in range(1, w - 1):
+                if data[r * w + c] != 0:
+                    continue
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    if data[(r + dr) * w + (c + dc)] == -1:
+                        frontier_set.add((r, c))
+                        break
+
+        visited: set[tuple[int, int]] = set()
+        centroids: list[tuple[float, float]] = []
+        for seed in frontier_set:
+            if seed in visited:
+                continue
+            cluster: list[tuple[int, int]] = []
+            stack = [seed]
+            visited.add(seed)
+            while stack:
+                r, c = stack.pop()
+                cluster.append((r, c))
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        if dr == 0 and dc == 0:
+                            continue
+                        nb = (r + dr, c + dc)
+                        if nb in frontier_set and nb not in visited:
+                            visited.add(nb)
+                            stack.append(nb)
+            if len(cluster) >= _MIN_FRONTIER_CELLS:
+                cr = sum(r for r, _ in cluster) / len(cluster)
+                cc = sum(c for _, c in cluster) / len(cluster)
+                centroids.append((ox + (cc + 0.5) * res, oy + (cr + 0.5) * res))
+        return centroids
 
     # ===== pickup substates ==========================================
 
@@ -469,8 +521,6 @@ class ExplorerNode(Node):
             dx, dy = self._door_exit_xy()
             self._publish_nav_goal_path(dx, dy)
             self._nav.send(dx, dy)
-        elif mode == "explore":
-            self._wp_idx = 0
 
     def _stop(self) -> None:
         self.cmd_pub.publish(Twist())
