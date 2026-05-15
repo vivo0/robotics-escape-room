@@ -40,6 +40,15 @@ ros-humble-joint-state-publisher = ">=2.3.0,<3"
 ros-humble-joint-state-publisher-gui = ">=2.3.0,<3"
 ros-humble-joy = ">=3.1.0,<4"
 
+# Nav2 + slam_toolbox (navigation stack)
+ros-humble-slam-toolbox = "*"
+ros-humble-navigation2 = "*"
+ros-humble-nav2-bringup = "*"
+ros-humble-nav2-msgs = "*"
+ros-humble-tf2-ros = "*"
+ros-humble-tf2-geometry-msgs = "*"
+ros-humble-action-msgs = "*"
+
 # robomaster_example dependencies
 transforms3d = ">=0.4.2,<0.5"
 

@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Mission state machine for the escape room.
 
+Navigation is delegated to Nav2 (NavigateToPose action).  Exploration uses
+predefined boustrophedon waypoints instead of custom frontier detection.
+Robot pose is read from the map→base_link TF published by slam_toolbox.
+
+Gripper control still uses the CoppeliaSim ZMQ API (Lua helpers injected by
+build_scene.py), as does cube attach/detach.
+
 State sequence:
 
     explore
@@ -10,61 +17,37 @@ State sequence:
       → drop_align → drop_open → drop_backup
       → go_to_door
       → done
-
-Pose source is the CoppeliaSim ZMQ API (exact pose, no TF lag). The
-gripper is driven by calling Lua helpers (``_ext_set_target`` /
-``_ext_get_state``) injected into the gripper child script by
-``build_scene.py``: the native CoppeliaSim signal API is per-script
-in modern versions, so writing the gripper signal from Python ZMQ
-never reaches the model's own reader.
 """
 from __future__ import annotations
 
 import math
 
-import numpy as np
 import rclpy
+import tf2_ros
+from action_msgs.msg import GoalStatus
+from geometry_msgs.msg import PoseStamped, Twist
+from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import Path as PathMsg
+from rclpy.action import ActionClient
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSProfile,
                        QoSReliabilityPolicy)
-
-from geometry_msgs.msg import Pose, PoseArray, PoseStamped, Twist
-from nav_msgs.msg import OccupancyGrid as OccupancyGridMsg
-from nav_msgs.msg import Path as PathMsg
+from rclpy.time import Time
 
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
-from escape_room.exploration import find_frontiers
-from escape_room.mapping.occupancy_grid import (FREE, OCCUPIED,
-                                                  GridSpec, OccupancyGrid)
-from escape_room.planning import PurePursuit, plan_path
-from escape_room.planning.pure_pursuit import PurePursuitConfig
-
 
 # Gripper state values mirror robomaster_msgs/action/GripperControl.
-GRIPPER_OPEN = 1
+GRIPPER_OPEN  = 1
 GRIPPER_CLOSE = 2
 
-
-def yaw_from_pose_matrix(mat) -> float:
-    R = np.array(mat, dtype=np.float64).reshape(3, 4)[:, :3]
-    return math.atan2(R[1, 0], R[0, 0])
-
-
-def occupancy_msg_to_grid(msg: OccupancyGridMsg) -> OccupancyGrid:
-    spec = GridSpec(
-        width_m=msg.info.width * msg.info.resolution,
-        height_m=msg.info.height * msg.info.resolution,
-        resolution=msg.info.resolution,
-        origin_x=msg.info.origin.position.x,
-        origin_y=msg.info.origin.position.y,
-    )
-    grid = OccupancyGrid(spec)
-    arr = np.array(msg.data, dtype=np.int8).reshape(
-        msg.info.height, msg.info.width)
-    grid.free[arr == FREE] = True
-    grid.occ[arr == OCCUPIED] = True
-    return grid
+# Default boustrophedon coverage for easy.json (5×4 m room, walls at ±2.5/±2).
+_DEFAULT_WAYPOINTS = [
+    (-1.5, -1.5), ( 0.0, -1.5), ( 1.5, -1.5),
+    ( 1.5,  0.0), ( 0.0,  0.0), (-1.5,  0.0),
+    (-1.5,  1.5), ( 0.0,  1.5), ( 1.5,  1.5),
+]
 
 
 def wrap_angle(a: float) -> float:
@@ -84,11 +67,10 @@ class ExplorerNode(Node):
         p = self.declare_parameter
         p('robot_alias',            '/RoboMasterEP/BaseLinkFrame')
         p('cube_alias',             '/TargetCube')
-        p('map_frame',              'world')
+        p('map_frame',              'map')
+        p('base_frame',             'base_link')
         p('control_rate_hz',        4.0)
-        p('replan_period_s',        1.0)
         p('robot_radius_m',         0.20)
-        p('frontier_min_size',      4)
         p('arrival_tol_m',          0.30)
         p('plate_arrival_tol_m',    0.55)
         p('door_push_m',            0.6)
@@ -105,37 +87,44 @@ class ExplorerNode(Node):
         p('gripper_timeout_s',      4.0)
 
         g = lambda n: self.get_parameter(n).value
-        self.map_frame           = g('map_frame')
-        self.robot_radius        = float(g('robot_radius_m'))
-        self.replan_period       = float(g('replan_period_s'))
-        self.frontier_min_size   = int(g('frontier_min_size'))
-        self.arrival_tol         = float(g('arrival_tol_m'))
-        self.plate_arrival_tol   = float(g('plate_arrival_tol_m'))
-        self.door_push           = float(g('door_push_m'))
-        self.engage_speed        = float(g('engage_speed_mps'))
-        self.engage_duration     = float(g('engage_duration_s'))
-        self.backup_speed        = float(g('drop_backup_speed_mps'))
-        self.backup_duration     = float(g('drop_backup_duration_s'))
-        self.drop_distance       = float(g('plate_drop_distance_m'))
-        self.drop_dist_tol       = float(g('plate_drop_dist_tol_m'))
-        self.park_max_speed      = float(g('park_max_speed_mps'))
-        self.align_yaw_tol       = float(g('align_yaw_tol_rad'))
-        self.align_kp            = float(g('align_kp'))
-        self.align_max_omega     = float(g('align_max_omega'))
-        self.gripper_timeout     = float(g('gripper_timeout_s'))
+        self._map_frame        = g('map_frame')
+        self._base_frame       = g('base_frame')
+        self.arrival_tol       = float(g('arrival_tol_m'))
+        self.plate_arrival_tol = float(g('plate_arrival_tol_m'))
+        self.door_push         = float(g('door_push_m'))
+        self.engage_speed      = float(g('engage_speed_mps'))
+        self.engage_duration   = float(g('engage_duration_s'))
+        self.backup_speed      = float(g('drop_backup_speed_mps'))
+        self.backup_duration   = float(g('drop_backup_duration_s'))
+        self.drop_distance     = float(g('plate_drop_distance_m'))
+        self.drop_dist_tol     = float(g('plate_drop_dist_tol_m'))
+        self.park_max_speed    = float(g('park_max_speed_mps'))
+        self.align_yaw_tol     = float(g('align_yaw_tol_rad'))
+        self.align_kp          = float(g('align_kp'))
+        self.align_max_omega   = float(g('align_max_omega'))
+        self.gripper_timeout   = float(g('gripper_timeout_s'))
 
-        # ----- sim handles -------------------------------------------
-        self.client = RemoteAPIClient()
-        self.sim = self.client.require('sim')
+        # ----- ZMQ (gripper + cube attach only) ----------------------
+        self._client = RemoteAPIClient()
+        self._sim    = self._client.require('sim')
 
         robot_alias = g('robot_alias')
         model_alias = '/' + robot_alias.lstrip('/').split('/')[0]
-        self.robot_h = self.sim.getObject(robot_alias)
-        model_h = self.sim.getObject(model_alias)
-        self.cube_h = self.sim.getObject(g('cube_alias'))
-        self.attach_h = self._find_in_tree(model_h, 'attachPoint')
-        gripper_link_h = self._find_in_tree(model_h, 'gripper_link_respondable')
-        self.gripper_script_h = self.sim.getScript(1, gripper_link_h)
+        self._robot_h = self._sim.getObject(robot_alias)
+        model_h       = self._sim.getObject(model_alias)
+        self._cube_h  = self._sim.getObject(g('cube_alias'))
+        self._attach_h      = self._find_in_tree(model_h, 'attachPoint')
+        gripper_link_h      = self._find_in_tree(model_h, 'gripper_link_respondable')
+        self._gripper_script_h = self._sim.getScript(1, gripper_link_h)
+
+        # ----- TF (robot pose in map frame) --------------------------
+        self._tf_buffer   = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+
+        # ----- Nav2 action client ------------------------------------
+        self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self._nav_goal_active  = False
+        self._nav_goal_handle  = None
 
         # ----- ROS pub/sub -------------------------------------------
         latched = QoSProfile(
@@ -143,13 +132,8 @@ class ExplorerNode(Node):
             reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
         )
-        self.create_subscription(
-            OccupancyGridMsg, '/map', self._on_map, latched)
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.path_pub = self.create_publisher(
-            PathMsg, '/exploration/path', 10)
-        self.frontiers_pub = self.create_publisher(
-            PoseArray, '/exploration/frontiers', 10)
+        self.cmd_pub  = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.path_pub = self.create_publisher(PathMsg, '/exploration/path', 10)
         for name in ('cube', 'plate', 'door'):
             self.create_subscription(
                 PoseStamped, f'/targets/{name}',
@@ -157,45 +141,37 @@ class ExplorerNode(Node):
 
         # ----- mission state -----------------------------------------
         self.targets: dict[str, tuple[float, float]] = {}
-        self.grid: OccupancyGrid | None = None
-        self.planner: PurePursuit | None = None
-        self.last_replan_t = 0.0
-        self.blacklist: set[tuple[int, int]] = set()
-        self.mode = 'explore'
-        self.action_t = 0.0     # generic phase timer
+        self.mode      = 'explore'
+        self.action_t  = 0.0
+        self._coverage_wps = list(_DEFAULT_WAYPOINTS)
+        self._wp_idx       = 0
 
-        # Mode → handler. Built once; bound methods include ``self``.
         self._handlers = {
-            'explore':       self._tick_navigate,
-            'go_to_key':     self._tick_navigate,
-            'go_to_plate':   self._tick_navigate,
-            'go_to_door':    self._tick_navigate,
-            'pickup_open':   self._tick_gripper_wait,
-            'pickup_close':  self._tick_gripper_wait,
-            'drop_open':     self._tick_gripper_wait,
-            'pickup_drive':  self._tick_engage,
-            'drop_align':    self._tick_drop_align,
-            'drop_backup':   self._tick_drop_backup,
-            'done':          self._stop,
+            'explore':      self._tick_navigate,
+            'go_to_key':    self._tick_navigate,
+            'go_to_plate':  self._tick_navigate,
+            'go_to_door':   self._tick_navigate,
+            'pickup_open':  self._tick_gripper_wait,
+            'pickup_close': self._tick_gripper_wait,
+            'drop_open':    self._tick_gripper_wait,
+            'pickup_drive': self._tick_engage,
+            'drop_align':   self._tick_drop_align,
+            'drop_backup':  self._tick_drop_backup,
+            'done':         self._stop,
         }
 
         self.create_timer(1.0 / float(g('control_rate_hz')), self._tick)
-        self.get_logger().info(
-            f'ready; robot_radius={self.robot_radius:.2f} m, '
-            f'replan {self.replan_period:.1f} s')
+        self.get_logger().info('ready; waiting for Nav2 and slam_toolbox...')
 
     # ===== handle resolution =========================================
 
     def _find_in_tree(self, root_h: int, alias: str) -> int:
-        for h in self.sim.getObjectsInTree(root_h):
-            if self.sim.getObjectAlias(int(h), 0) == alias:
+        for h in self._sim.getObjectsInTree(root_h):
+            if self._sim.getObjectAlias(int(h), 0) == alias:
                 return int(h)
         raise RuntimeError(f'object not found in robot tree: {alias}')
 
     # ===== ROS callbacks =============================================
-
-    def _on_map(self, msg: OccupancyGridMsg) -> None:
-        self.grid = occupancy_msg_to_grid(msg)
 
     def _on_target(self, name: str, msg: PoseStamped) -> None:
         if name in self.targets:
@@ -212,54 +188,82 @@ class ExplorerNode(Node):
     def _tick(self) -> None:
         self._handlers[self.mode]()
 
-    # --- shared navigation tick (explore/go_to_key/plate/door) -------
+    # --- navigation tick (explore / go_to_key / go_to_plate / go_to_door) --
 
     def _tick_navigate(self) -> None:
-        if self.grid is None:
+        if self._nav_goal_active:
             return
-        pose = self._pose()
-        if pose is None:
-            return
-        rx, ry, ryaw = pose
 
-        if self.mode == 'go_to_key' and self._dist(rx, ry, self.targets['cube']) <= self.arrival_tol:
+        if self.mode == 'explore':
+            if len(self.targets) == 3:
+                self._enter('go_to_key')
+                return
+            self._send_next_waypoint()
+        elif self.mode == 'go_to_key':
             self._begin_pickup()
-            return
-        if self.mode == 'go_to_plate' and self._dist(rx, ry, self.targets['plate']) <= self.plate_arrival_tol:
+        elif self.mode == 'go_to_plate':
             self._begin_drop()
-            return
-        if self.mode == 'go_to_door' and self._dist(rx, ry, self._door_exit_xy()) <= self.arrival_tol:
+        elif self.mode == 'go_to_door':
             self._enter('done')
             self._stop()
-            self.planner = None
+
+    # --- Nav2 goal management ----------------------------------------
+
+    def _send_nav_goal(self, x: float, y: float, yaw: float = 0.0) -> None:
+        if not self._nav_client.wait_for_server(timeout_sec=0.0):
+            self.get_logger().warn('Nav2 action server not available yet')
             return
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = self._map_frame
+        goal.pose.header.stamp    = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = float(x)
+        goal.pose.pose.position.y = float(y)
+        goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        self._nav_goal_active = True
+        future = self._nav_client.send_goal_async(goal)
+        future.add_done_callback(self._on_goal_accepted)
 
-        now = self._clock_s()
-        if self._needs_replan(now, rx, ry):
-            self._replan(rx, ry)
-            self.last_replan_t = now
+        self._publish_nav_goal_path(x, y)
 
-        if self.planner is None:
-            self._stop()
+    def _on_goal_accepted(self, future) -> None:
+        handle = future.result()
+        if not handle.accepted:
+            self.get_logger().warn('Nav2 rejected goal')
+            self._nav_goal_active = False
             return
+        self._nav_goal_handle = handle
+        handle.get_result_async().add_done_callback(self._on_nav_result)
 
-        v, w = self.planner.step(rx, ry, ryaw)
-        twist = Twist()
-        twist.linear.x = float(v)
-        twist.angular.z = float(w)
-        self.cmd_pub.publish(twist)
+    def _on_nav_result(self, future) -> None:
+        status = future.result().status
+        self._nav_goal_active = False
+        self._nav_goal_handle = None
+        if status != GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().warn(f'Nav2 goal finished with status {status}')
+
+    def _cancel_nav(self) -> None:
+        if self._nav_goal_handle is not None:
+            self._nav_goal_handle.cancel_goal_async()
+        self._nav_goal_active = False
+        self._nav_goal_handle = None
+
+    def _send_next_waypoint(self) -> None:
+        if self._wp_idx >= len(self._coverage_wps):
+            self._wp_idx = 0
+        x, y = self._coverage_wps[self._wp_idx]
+        self._wp_idx += 1
+        self._send_nav_goal(x, y)
 
     # --- pickup substates --------------------------------------------
 
     def _begin_pickup(self) -> None:
         self._stop()
-        self.planner = None
         self._enter('pickup_open')
         self.action_t = self._clock_s()
         self._set_gripper(GRIPPER_OPEN)
 
     def _tick_engage(self) -> None:
-        """Slow forward creep so the cube slips between the fingers."""
         if self._clock_s() - self.action_t >= self.engage_duration:
             self._stop()
             self._enter('pickup_close')
@@ -274,21 +278,17 @@ class ExplorerNode(Node):
 
     def _begin_drop(self) -> None:
         self._stop()
-        self.planner = None
         self._enter('drop_align')
 
     def _tick_drop_align(self) -> None:
-        """Two-phase parking: rotate to face the plate, then advance/
-        retreat until the robot is exactly ``drop_distance`` from the
-        plate (gripper offset). Then transition to ``drop_open``."""
-        pose = self._pose()
+        pose = self._get_robot_pose()
         if pose is None:
             return
         rx, ry, ryaw = pose
         px, py = self.targets['plate']
-        dist = math.hypot(px - rx, py - ry)
+        dist       = math.hypot(px - rx, py - ry)
         target_yaw = math.atan2(py - ry, px - rx)
-        yaw_err = wrap_angle(target_yaw - ryaw)
+        yaw_err    = wrap_angle(target_yaw - ryaw)
 
         if abs(yaw_err) > self.align_yaw_tol:
             twist = Twist()
@@ -306,18 +306,15 @@ class ExplorerNode(Node):
             self._set_gripper(GRIPPER_OPEN)
             return
         twist = Twist()
-        twist.linear.x = clamp(
+        twist.linear.x  = clamp(
             0.5 * dist_err, -self.park_max_speed, self.park_max_speed)
         twist.angular.z = 0.5 * yaw_err
         self.cmd_pub.publish(twist)
 
     def _tick_drop_backup(self) -> None:
-        """Reverse to clear the gripper of the cube before the rotation
-        that the next state's pure-pursuit path will start with."""
         if self._clock_s() - self.action_t >= self.backup_duration:
             self._stop()
             self._enter('go_to_door')
-            self.planner = None
             return
         twist = Twist()
         twist.linear.x = -self.backup_speed
@@ -333,7 +330,6 @@ class ExplorerNode(Node):
         elif self.mode == 'pickup_close' and self._gripper_reached(GRIPPER_CLOSE):
             self._attach_cube()
             self._enter('go_to_plate')
-            self.planner = None
         elif self.mode == 'drop_open' and self._gripper_reached(GRIPPER_OPEN):
             self._detach_cube()
             self._enter('drop_backup')
@@ -342,158 +338,47 @@ class ExplorerNode(Node):
     # ===== sim plumbing ==============================================
 
     def _set_gripper(self, state: int) -> None:
-        self.sim.callScriptFunction(
-            '_ext_set_target', self.gripper_script_h, int(state))
+        self._sim.callScriptFunction(
+            '_ext_set_target', self._gripper_script_h, int(state))
 
     def _gripper_reached(self, target_state: int) -> bool:
         if self._clock_s() - self.action_t >= self.gripper_timeout:
             self.get_logger().warn(
                 f'gripper timeout waiting for {target_state}')
             return True
-        cur = self.sim.callScriptFunction(
-            '_ext_get_state', self.gripper_script_h)
+        cur = self._sim.callScriptFunction(
+            '_ext_get_state', self._gripper_script_h)
         return cur is not None and int(cur) == target_state
 
     def _attach_cube(self) -> None:
-        self.sim.setObjectParent(self.cube_h, self.attach_h, True)
-        self.sim.resetDynamicObject(self.cube_h)
+        self._sim.setObjectParent(self._cube_h, self._attach_h, True)
+        self._sim.resetDynamicObject(self._cube_h)
 
     def _detach_cube(self) -> None:
-        self.sim.setObjectParent(self.cube_h, -1, True)
-        self.sim.resetDynamicObject(self.cube_h)
+        self._sim.setObjectParent(self._cube_h, -1, True)
+        self._sim.resetDynamicObject(self._cube_h)
 
-    def _pose(self) -> tuple[float, float, float] | None:
-        mat = self.sim.getObjectMatrix(self.robot_h, -1)
-        return float(mat[3]), float(mat[7]), yaw_from_pose_matrix(mat)
+    def _get_robot_pose(self) -> tuple[float, float, float] | None:
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                self._map_frame, self._base_frame,
+                Time(), timeout=Duration(seconds=0.1))
+            x   = tf.transform.translation.x
+            y   = tf.transform.translation.y
+            q   = tf.transform.rotation
+            yaw = math.atan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y ** 2 + q.z ** 2))
+            return float(x), float(y), float(yaw)
+        except Exception:
+            return None
 
     def _clock_s(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
-    # ===== planning ==================================================
-
-    def _needs_replan(self, now: float, rx: float, ry: float) -> bool:
-        return (self.planner is None
-                or now - self.last_replan_t >= self.replan_period
-                or self.planner.is_finished((rx, ry)))
-
-    def _replan(self, rx: float, ry: float) -> None:
-        infl_cells = max(1, int(math.ceil(
-            self.robot_radius / self.grid.spec.resolution)))
-        infl = self.grid.inflate(infl_cells)
-
-        if self.mode == 'go_to_key':
-            self._replan_to(self.grid, infl, rx, ry, self.targets['cube'])
-        elif self.mode == 'go_to_plate':
-            self._replan_to(self.grid, infl, rx, ry, self.targets['plate'])
-        elif self.mode == 'go_to_door':
-            self._replan_to(self.grid, infl, rx, ry, self._door_exit_xy())
-        else:
-            self._replan_frontier(self.grid, infl, rx, ry)
-
-    def _replan_to(self, grid: OccupancyGrid, infl: OccupancyGrid,
-                   rx: float, ry: float,
-                   target: tuple[float, float]) -> None:
-        """A* directly to ``target``. If the corridor still crosses
-        UNKNOWN cells (treated as blocked), fall back to the closest
-        reachable frontier toward the target."""
-        # 1) try the exact target plus a small ring of free cells around it.
-        for goal in [target] + self._free_ring(infl, target):
-            path = plan_path(infl, (rx, ry), goal)
-            if path is not None and len(path) >= 2:
-                self._adopt_path(path)
-                return
-
-        # 2) pick the closest reachable frontier to the target.
-        frontiers = find_frontiers(grid, min_size=self.frontier_min_size)
-        self._publish_frontiers(frontiers)
-        ranked = sorted(
-            ((math.hypot(f.centroid_xy[0] - target[0],
-                         f.centroid_xy[1] - target[1]), f)
-             for f in frontiers if self._eligible(infl, f)),
-            key=lambda x: x[0])
-        for _, f in ranked:
-            path = plan_path(infl, (rx, ry), f.centroid_xy)
-            if path is None or len(path) < 2:
-                self.blacklist.add(infl.world_to_grid(*f.centroid_xy))
-                continue
-            self._adopt_path(path)
-            return
-
-        self.planner = None
-
-    def _replan_frontier(self, grid: OccupancyGrid, infl: OccupancyGrid,
-                         rx: float, ry: float) -> None:
-        """Frontier-driven exploration: pick the highest size/distance
-        frontier the robot can reach."""
-        frontiers = find_frontiers(grid, min_size=self.frontier_min_size)
-        self._publish_frontiers(frontiers)
-        if not frontiers:
-            self._enter('done')
-            self.planner = None
-            return
-
-        ranked: list[tuple[float, object]] = []
-        for f in frontiers:
-            if not self._eligible(infl, f):
-                continue
-            d = math.hypot(f.centroid_xy[0] - rx, f.centroid_xy[1] - ry)
-            if d < 1e-3:
-                continue
-            ranked.append((f.size / d, f))
-        ranked.sort(reverse=True)
-
-        for _, f in ranked:
-            path = plan_path(infl, (rx, ry), f.centroid_xy)
-            if path is None or len(path) < 2:
-                self.blacklist.add(infl.world_to_grid(*f.centroid_xy))
-                continue
-            self._adopt_path(path)
-            return
-
-        self.planner = None
-
-    def _eligible(self, infl: OccupancyGrid, f) -> bool:
-        cc, cr = infl.world_to_grid(*f.centroid_xy)
-        return ((cc, cr) not in self.blacklist
-                and infl.is_traversable(cc, cr))
-
-    def _adopt_path(self, path: list[tuple[float, float]]) -> None:
-        self.planner = PurePursuit(path, PurePursuitConfig())
-        self._publish_path(path)
-
-    def _free_ring(self, grid: OccupancyGrid,
-                   xy: tuple[float, float]) -> list[tuple[float, float]]:
-        """Free cells in a small ring around ``xy``, sorted by
-        distance. Used as a fall-back goal when the exact target cell
-        is in the inflation buffer."""
-        cc, cr = grid.world_to_grid(*xy)
-        res = grid.spec.resolution
-        ox, oy = grid.spec.origin_x, grid.spec.origin_y
-        out: list[tuple[float, tuple[float, float]]] = []
-        for dr in range(-4, 5):
-            for dc in range(-4, 5):
-                if dc == 0 and dr == 0:
-                    continue
-                nc, nr = cc + dc, cr + dr
-                if not grid.in_bounds(nc, nr):
-                    continue
-                if not grid.is_traversable(nc, nr):
-                    continue
-                wx = ox + (nc + 0.5) * res
-                wy = oy + (nr + 0.5) * res
-                out.append((math.hypot(wx - xy[0], wy - xy[1]), (wx, wy)))
-        out.sort()
-        return [w for _, w in out]
-
     # ===== geometric helpers =========================================
 
-    @staticmethod
-    def _dist(rx: float, ry: float, xy: tuple[float, float]) -> float:
-        return math.hypot(xy[0] - rx, xy[1] - ry)
-
     def _door_exit_xy(self) -> tuple[float, float]:
-        """Door target pushed outward from the room origin so the robot
-        drives through the open gap rather than stopping at the wall."""
         dx, dy = self.targets['door']
         n = math.hypot(dx, dy)
         if n < 1e-3:
@@ -504,38 +389,34 @@ class ExplorerNode(Node):
 
     def _enter(self, mode: str) -> None:
         self.get_logger().info(f'mode: {self.mode} → {mode}')
+        self._cancel_nav()
         self.mode = mode
+        if mode == 'go_to_key':
+            self._send_nav_goal(*self.targets['cube'])
+        elif mode == 'go_to_plate':
+            self._send_nav_goal(*self.targets['plate'])
+        elif mode == 'go_to_door':
+            self._send_nav_goal(*self._door_exit_xy())
+        elif mode == 'explore':
+            self._wp_idx = 0
 
     def _stop(self) -> None:
         self.cmd_pub.publish(Twist())
 
-    def _publish_path(self, path: list[tuple[float, float]]) -> None:
+    def _publish_nav_goal_path(self, x: float, y: float) -> None:
         msg = PathMsg()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = self.map_frame
-        for x, y in path:
-            ps = PoseStamped()
-            ps.header = msg.header
-            ps.pose.position.x = float(x)
-            ps.pose.position.y = float(y)
-            ps.pose.orientation.w = 1.0
-            msg.poses.append(ps)
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = self._map_frame
+        ps = PoseStamped()
+        ps.header = msg.header
+        ps.pose.position.x = x
+        ps.pose.position.y = y
+        ps.pose.orientation.w = 1.0
+        msg.poses = [ps]
         self.path_pub.publish(msg)
 
-    def _publish_frontiers(self, frontiers) -> None:
-        msg = PoseArray()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = self.map_frame
-        for f in frontiers:
-            p = Pose()
-            p.position.x = float(f.centroid_xy[0])
-            p.position.y = float(f.centroid_xy[1])
-            p.orientation.w = 1.0
-            msg.poses.append(p)
-        self.frontiers_pub.publish(msg)
 
-
-def main(args=None):
+def main(args=None) -> None:
     rclpy.init(args=args)
     node = None
     try:

@@ -18,6 +18,7 @@ setup(
         ),
         (os.path.join("share", package_name, "models"), glob("models/*.ttm")),
         (os.path.join("share", package_name, "scenarios"), glob("scenarios/*.json")),
+        (os.path.join("share", package_name, "config"), glob("config/*.yaml")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -28,7 +29,7 @@ setup(
     entry_points={
         "console_scripts": [
             "door_controller = escape_room.nodes.door_controller:main",
-            "mapper_node = escape_room.nodes.mapper_node:main",
+            "lidar_node = escape_room.nodes.lidar_node:main",
             "explorer_node = escape_room.nodes.explorer_node:main",
             "color_detector_node = escape_room.nodes.color_detector_node:main",
         ],

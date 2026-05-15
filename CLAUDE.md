@@ -49,22 +49,24 @@ Tests are style-only (`ament_flake8`, `ament_pep257`, `ament_copyright`). There 
 
 ## Architecture
 
-The project follows a two-phase pipeline (see `escape_room_pipeline.md` for the full design):
+The project uses a Nav2 + slam_toolbox navigation stack:
 
-**Phase 1 — Discovery**: the robot explores reactively, builds an occupancy-grid map from ToF sensors, and detects three coloured landmarks (cube, pressure plate, door) via HSV masking on the camera image.
+**Discovery**: `lidar_node` casts ground-truth rays against CoppeliaSim scene geometry and publishes `sensor_msgs/LaserScan` on `/scan`. `slam_toolbox` builds a 2D occupancy map from these scans and provides `map→odom` localisation. `color_detector_node` finds coloured landmarks via HSV masking on the camera image.
 
-**Phase 2 — Execution**: once all landmarks are known the robot plans paths with A* on the grid (with morphological inflation), follows them with pure pursuit, grasps the cube, places it on the pressure plate, and exits through the door.
+**Execution**: `explorer_node` sends `NavigateToPose` action goals to Nav2 for all navigation (exploration waypoints, go-to-key, go-to-plate, go-to-door). Short-range gripper manoeuvres (cube pickup alignment, plate drop alignment) still use direct `cmd_vel`. Gripper and cube attach/detach are driven via CoppeliaSim ZMQ.
 
-### ROS nodes (planned, inside `src/escape_room/escape_room/nodes/`)
+### ROS nodes (`src/escape_room/escape_room/nodes/`)
 
 | Node | Role |
 |---|---|
-| `color_detector` | Camera → HSV → blob → `PoseStamped` on latched topics `targets/cube`, `targets/plate`, `targets/door` |
-| `mapper` | ToF ranges + odometry → occupancy grid → `/map` (`OccupancyGrid`, 10 cm/cell) |
-| `planner` | A* on `/map` + pure-pursuit follower → `cmd_vel` |
-| `mission` | Global state machine that orchestrates all other nodes, drives gripper/LEDs |
+| `lidar_node` | ZMQ ray-caster → `/scan` (LaserScan, 10 Hz) + static `base_link→laser` TF |
+| `color_detector_node` | Camera → HSV → blob → `PoseStamped` on `/targets/{cube,plate,door}` |
+| `explorer_node` | Mission FSM: sends Nav2 `NavigateToPose` goals + gripper control via ZMQ |
+| `door_controller` | Polls CoppeliaSim via ZMQ, opens door when cube is on pressure plate |
 
-Currently only `door_controller` is implemented. It polls CoppeliaSim via ZMQ every 100 ms, detects when the cube is positioned on the pressure plate within a configurable XY margin, and slides the door open by dropping it below the floor.
+**slam_toolbox** and **Nav2** run as external packages launched via `discovery.launch.py`.
+
+Currently the door_controller and color_detector_node are fully implemented. The explorer_node is the mission FSM that delegates navigation to Nav2.
 
 ### CoppeliaSim bridge
 
@@ -78,13 +80,15 @@ Scenarios live in `src/escape_room/scenarios/`. Each file fully describes the ro
 - `obstacles` — list of `box`/`cylinder` primitives
 - `target_cube`, `pressure_plate`, `door` — landmark positions, sizes, and RGB colours
 
-Object colours must match the HSV ranges in `color_detector_node.py` (cube: magenta ~280–340°; plate: green 80–160°; door: blue 200–260°). The key avoids red (Velodyne beams render red in the camera frame) and yellow (the CoppeliaSim default floor pattern is yellow); magenta is the safe distinct hue.
+Object colours must match the HSV ranges in `color_detector_node.py` (cube: magenta ~280–340°; plate: green 80–160°; door: blue 200–260°). The key avoids red (previously Velodyne beams rendered red; now no Velodyne in the scene) and yellow (the CoppeliaSim default floor pattern is yellow); magenta is the safe distinct hue.
 
 ### Key source locations
 
 - `src/escape_room/escape_room/nodes/` — ROS2 node implementations
+- `src/escape_room/config/` — slam_toolbox and Nav2 YAML parameter files
+- `src/escape_room/launch/discovery.launch.py` — main launch (lidar + slam + Nav2 + mission)
 - `src/escape_room/scripts/build_scene.py` — scene builder (run standalone, not via colcon)
 - `src/escape_room/scenarios/` — scenario JSON files
-- `src/escape_room/models/` — CoppeliaSim `.ttm` robot model files
+- `src/escape_room/models/` — CoppeliaSim `.ttm` robot model files (use `RoboMasterEP.ttm`, not the lidar variant)
 - `src/robomaster_ros/` — upstream RoboMaster ROS2 driver (do not modify)
 - `src/robomaster_sim/` — upstream CoppeliaSim simulation plugin (do not modify)
