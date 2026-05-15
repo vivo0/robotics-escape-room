@@ -22,6 +22,23 @@
 set -euo pipefail
 
 SCENARIO="${1:-src/escape_room/scenarios/easy.json}"
+
+# Kill any leftover nodes from a previous run to avoid duplicate TF publishers.
+echo "[run] Killing previous escape_room processes..."
+pkill -f "discovery.launch.py"        2>/dev/null || true
+pkill -f "escape_room.nodes.lidar_node"          2>/dev/null || true
+pkill -f "escape_room.nodes.explorer_node"       2>/dev/null || true
+pkill -f "escape_room.nodes.color_detector_node" 2>/dev/null || true
+pkill -f "escape_room.nodes.door_controller"     2>/dev/null || true
+pkill -f "async_slam_toolbox_node"    2>/dev/null || true
+pkill -f "nav2"                       2>/dev/null || true
+pkill -f "rviz2"                      2>/dev/null || true
+pkill -f "ros2 launch robomaster_ros" 2>/dev/null || true
+pkill -f robomaster_driver            2>/dev/null || true
+pkill -f "robot_state_publisher"      2>/dev/null || true
+pkill -f "joint_state_publisher"      2>/dev/null || true
+sleep 1
+
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_ROOT"
 
@@ -84,11 +101,6 @@ PY
 # the previous one from the simulated robot; reusing it would publish stale
 # /odom but no TF). Kill the launch process and all children, then relaunch.
 echo "[run] (Re)starting robomaster_ros driver..."
-pkill -f "ros2 launch robomaster_ros" 2>/dev/null || true
-pkill -f robomaster_driver 2>/dev/null || true
-pkill -f "robot_state_publisher" 2>/dev/null || true
-pkill -f "joint_state_publisher" 2>/dev/null || true
-sleep 1
 ros2 launch robomaster_ros ep.launch >/tmp/robomaster_ros.log 2>&1 &
 
 echo "[run] Waiting for /odom topic..."
@@ -106,12 +118,8 @@ for i in $(seq 1 30); do
 done
 
 # 7. Launch the door controller in the background
-if pgrep -f "escape_room.nodes.door_controller" >/dev/null 2>&1; then
-    echo "[run] door_controller already running."
-else
-    echo "[run] Launching door_controller in background..."
-    ros2 run escape_room door_controller >/tmp/door_controller.log 2>&1 &
-fi
+echo "[run] Launching door_controller in background..."
+ros2 run escape_room door_controller >/tmp/door_controller.log 2>&1 &
 
 # 8. Discovery launch in the foreground (mapper + static TF)
 echo "[run] Launching discovery (mapper + velodyne TF). Ctrl-C to stop..."
