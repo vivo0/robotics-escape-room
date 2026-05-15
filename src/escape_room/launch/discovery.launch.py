@@ -24,7 +24,18 @@ def generate_launch_description() -> LaunchDescription:
     slam_params = os.path.join(pkg_dir, 'config', 'slam_toolbox_params.yaml')
     nav2_params = os.path.join(pkg_dir, 'config', 'nav2_params.yaml')
 
+    rviz_config = os.path.join(pkg_dir, 'config', 'escape_room.rviz')
+
     return LaunchDescription([
+        # RViz2 visualization (map, scan, costmaps, path)
+        Node(
+            package='rviz2',
+            executable='rviz2',
+            name='rviz2',
+            arguments=['-d', rviz_config],
+            output='log',
+        ),
+
         # 2D virtual LiDAR: ZMQ ground-truth rays → /scan + base_link→laser TF
         Node(
             package='escape_room',
