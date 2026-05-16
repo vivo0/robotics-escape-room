@@ -23,6 +23,7 @@ _MANAGED_PREFIXES = (
     "Obstacle_",
     "TargetCube",
     "PressurePlate",
+    "LidarSensor",
     "RoboMasterEP",
     "RoboMasterS1",
 )
@@ -234,11 +235,12 @@ def _resolve_model_path(robot_cfg, sim):
     return f"{coppelia_root}/../models/robots/mobile/{robot_cfg['model']}.ttm"
 
 
-# Loaded once at import time; path is relative to this file so the script
-# can be invoked from any working directory.
+# Lua scripts loaded once at import time; paths are relative to this file.
 _GRIPPER_HELPERS_LUA = (
     Path(__file__).resolve().parent / "gripper_helpers.lua"
 ).read_text()
+
+_LIDAR_SENSOR_LUA = (Path(__file__).resolve().parent / "lidar_sensor.lua").read_text()
 
 
 def _inject_gripper_helpers(sim, robot_h, model_name):
@@ -254,14 +256,48 @@ def _inject_gripper_helpers(sim, robot_h, model_name):
     )
     if gripper_h is None:
         raise RuntimeError(f"gripper_link_respondable not found in {model_name}")
-    script_h = sim.getScript(1, gripper_h)  # 1 = child script
-    src = sim.getScriptStringParam(script_h, sim.scriptstringparam_text)
+
+    script_h = sim.getScript(sim.scripttype_childscript, gripper_h)
+
+    # Retrieve raw bytes and decode to standard string
+    raw_src = sim.getObjectStringParam(script_h, sim.scriptstringparam_text)
+    src = raw_src.decode("utf-8") if isinstance(raw_src, bytes) else raw_src
+
     if "function _ext_set_target" in src:
         return
-    sim.setScriptStringParam(
+
+    sim.setObjectStringParam(
         script_h, sim.scriptstringparam_text, src + _GRIPPER_HELPERS_LUA
     )
     print(f"[builder] injected gripper helpers into {model_name} script")
+
+
+def _attach_lidar_sensor(sim, robot_h):
+    """Create a LidarSensor dummy as child of BaseLinkFrame and inject the Lua script."""
+    base_frame_h = next(
+        (
+            int(h)
+            for h in sim.getObjectsInTree(robot_h)
+            if sim.getObjectAlias(int(h), 0) == "BaseLinkFrame"
+        ),
+        None,
+    )
+    if base_frame_h is None:
+        raise RuntimeError("BaseLinkFrame not found in robot tree")
+
+    # Ray sensor starts inside the chassis. Remove detectability from the
+    # entire robot tree so rays pass through the body and hit real obstacles.
+    for h in sim.getObjectsInTree(robot_h):
+        sim.setObjectSpecialProperty(int(h), 0)
+
+    dummy_h = sim.createDummy(0.01)
+    sim.setObjectParent(dummy_h, base_frame_h, True)
+    sim.setObjectPosition(dummy_h, [0.0, 0.0, 0.0], base_frame_h)
+    sim.setObjectAlias(dummy_h, "LidarSensor")
+
+    script_h = sim.createScript(sim.scripttype_childscript, _LIDAR_SENSOR_LUA)
+    sim.setObjectParent(script_h, dummy_h, True)
+    print("[builder] attached LidarSensor script to robot")
 
 
 def load_robot(sim, robot_cfg):
@@ -292,6 +328,7 @@ def load_robot(sim, robot_cfg):
         sim.resetDynamicObject(h)
 
     _inject_gripper_helpers(sim, handle, model_name)
+    _attach_lidar_sensor(sim, handle)
     return handle
 
 

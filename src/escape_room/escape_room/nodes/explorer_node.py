@@ -29,7 +29,8 @@ from action_msgs.msg import GoalStatus
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 from geometry_msgs.msg import PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose
-from nav_msgs.msg import OccupancyGrid, Path as PathMsg
+from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import Path as PathMsg
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -162,6 +163,8 @@ class NavClient:
 # ── ExplorerNode ──────────────────────────────────────────────────────────
 
 
+# TODO: remove zmq from color detection
+# TODO: deslop configs
 class ExplorerNode(Node):
     """Mission FSM: sends Nav2 goals and drives gripper via ZMQ."""
 
@@ -342,9 +345,7 @@ class ExplorerNode(Node):
         self._publish_nav_goal_path(fx, fy)
         self._nav.send(fx, fy)
 
-    def _compute_frontiers(
-        self, grid: OccupancyGrid
-    ) -> list[tuple[float, float]]:
+    def _compute_frontiers(self, grid: OccupancyGrid) -> list[tuple[float, float]]:
         """Return world-frame centroids of frontier clusters.
 
         A frontier cell is a free cell (0) with at least one unknown (-1)

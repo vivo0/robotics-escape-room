@@ -1,12 +1,13 @@
 """
 Nav2 navigation stack launch for the escape room.
 
-Replaces the old mapper_node + custom A*/pure-pursuit with:
-    - lidar_node:         CoppeliaSim ground-truth rays → /scan + base_link→laser TF
+    - static_transform_publisher: base_link → laser_link
     - slam_toolbox:       /scan → /map + map→odom TF
     - nav2 bringup:       costmap + NavFn planner + RPP controller + BT navigator
     - color_detector_node: HSV landmark detection
     - explorer_node:       mission FSM using Nav2 NavigateToPose action
+
+/scan is produced by lidar_sensor.lua injected into CoppeliaSim by build_scene.py.
 """
 
 import os
@@ -29,6 +30,31 @@ def generate_launch_description() -> LaunchDescription:
 
     return LaunchDescription(
         [
+            # Static TF: base_link → laser_link (TRANSIENT_LOCAL — always
+            # received by slam_toolbox regardless of startup order).
+            Node(
+                package="tf2_ros",
+                executable="static_transform_publisher",
+                name="base_link_to_laser_link",
+                arguments=[
+                    "--x",
+                    "0",
+                    "--y",
+                    "0",
+                    "--z",
+                    "0.12",
+                    "--yaw",
+                    "0",
+                    "--pitch",
+                    "0",
+                    "--roll",
+                    "0",
+                    "--frame-id",
+                    "base_link",
+                    "--child-frame-id",
+                    "laser_link",
+                ],
+            ),
             # RViz2 visualization (map, scan, costmaps, path)
             Node(
                 package="rviz2",
@@ -37,13 +63,6 @@ def generate_launch_description() -> LaunchDescription:
                 arguments=["-d", rviz_config],
                 ros_arguments=["--log-level", "WARN"],
                 output="log",
-            ),
-            # 2D virtual LiDAR: ZMQ ground-truth rays → /scan + base_link→laser TF
-            Node(
-                package="escape_room",
-                executable="lidar_node",
-                name="lidar_node",
-                output="screen",
             ),
             # SLAM: /scan + odom→base_link → /map + map→odom
             Node(
