@@ -113,6 +113,11 @@ class NavClient:
         """True while a Nav2 goal is in flight."""
         return self._active
 
+    @property
+    def server_ready(self) -> bool:
+        """True when the Nav2 action server has been discovered."""
+        return self._client.wait_for_server(timeout_sec=0.0)
+
     def send(self, x: float, y: float, yaw: float = 0.0) -> bool:
         """Send a NavigateToPose goal. Returns False if server unavailable."""
         if not self._client.wait_for_server(timeout_sec=0.0):
@@ -248,6 +253,7 @@ class ExplorerNode(Node):
         self.mode = "explore"
         self.action_t = 0.0
         self._current_map: OccupancyGrid | None = None
+        self._started = False
 
         self._handlers = {
             "explore": self._tick_navigate,
@@ -286,7 +292,21 @@ class ExplorerNode(Node):
     # ===== main loop =================================================
 
     def _tick(self) -> None:
+        if not self._started:
+            if self._is_ready():
+                self._started = True
+                self.get_logger().info("Nav2 + map + TF ready; starting mission")
+            return
         self._handlers[self.mode]()
+
+    def _is_ready(self) -> bool:
+        if not self._nav.server_ready:
+            return False
+        if self._current_map is None:
+            return False
+        if self._get_robot_pose() is None:
+            return False
+        return True
 
     # ===== navigation tick ===========================================
 
