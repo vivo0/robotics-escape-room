@@ -293,6 +293,9 @@ def _attach_lidar_sensor(sim, robot_h):
     dummy_h = sim.createDummy(0.01)
     sim.setObjectParent(dummy_h, base_frame_h, True)
     sim.setObjectPosition(dummy_h, [0.0, 0.0, 0.0], base_frame_h)
+    # Dummy copies BaseLinkFrame's exact world orientation
+    # And BaseLinkFrame's X-axis IS physical forward
+    sim.setObjectOrientation(dummy_h, [0.0, 0.0, 0.0], base_frame_h)
     sim.setObjectAlias(dummy_h, "LidarSensor")
 
     script_h = sim.createScript(sim.scripttype_childscript, _LIDAR_SENSOR_LUA)

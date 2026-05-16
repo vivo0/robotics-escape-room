@@ -35,7 +35,7 @@ local lastT        = -1e9
 
 function sysCall_init()
     -- Hierarchy: RoboMasterEP / BaseLinkFrame / LidarSensor (this object)
-    robotHandle = sim.getObject('..')        -- BaseLinkFrame
+    robotHandle = sim.getObject('..')        -- LidarSensor dummy (script parent; Rz-90 relative to BaseLinkFrame)
 
     -- Create a Ray-type proximity sensor programmatically.
     sensorHandle = sim.createProximitySensor(
@@ -73,9 +73,8 @@ function sysCall_sensing()
     local rx  = mat[4]
     local ry  = mat[8]
     local rz  = mat[12]
-    -- RoboMaster BaseLinkFrame is -Y-forward in CoppeliaSim.
-    -- Extract angle of -Y-axis (physical forward) so scan angle=0 = forward.
-    local yaw = math.atan(-mat[6], -mat[2])
+    -- LidarSensor dummy is Rz(-90°) relative to BaseLinkFrame, so +X = physical forward.
+    local yaw = math.atan(mat[5], mat[1])
     local oz  = rz + LASER_Z
 
     -- Clear previous visualization frame.
@@ -126,19 +125,12 @@ function sysCall_sensing()
     -- this TF in simulation; without it slam_toolbox and Nav2 have no odom frame.
     local p = sim.getObjectPosition(robotHandle, -1)
     local q = sim.getObjectQuaternion(robotHandle, -1)
-    -- CoppeliaSim BaseLinkFrame is -Y-forward; ROS expects X-forward base_link.
-    -- Correct by composing q_sim * Rz(-90°) so base_link +X = physical forward.
-    local s = math.sqrt(0.5)
-    local qrx = s * ( q[1] - q[2])
-    local qry = s * ( q[1] + q[2])
-    local qrz = s * ( q[3] - q[4])
-    local qrw = s * ( q[3] + q[4])
     simROS2.sendTransform({
         header         = {stamp = stamp, frame_id = 'odom'},
         child_frame_id = 'base_link',
         transform      = {
             translation = {x = p[1], y = p[2], z = p[3]},
-            rotation    = {x = qrx, y = qry, z = qrz, w = qrw},
+            rotation    = {x = q[1], y = q[2], z = q[3], w = q[4]},
         },
     })
 
@@ -159,7 +151,7 @@ function sysCall_sensing()
         pose = {
             pose = {
                 position    = {x = p[1], y = p[2], z = p[3]},
-                orientation = {x = qrx, y = qry, z = qrz, w = qrw},
+                orientation = {x = q[1], y = q[2], z = q[3], w = q[4]},
             },
             covariance = zero36,
         },
