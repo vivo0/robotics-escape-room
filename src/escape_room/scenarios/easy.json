@@ -15,9 +15,9 @@
     "orientation": [0, 0, -90]
   },
   "obstacles": [
-    {"type": "box",      "position": [0.0,  0.0, 0.25], "size": [0.5, 0.5, 0.5]},
+    {"type": "cuboid",   "position": [0.0,  0.0, 0.25], "size": [0.5, 0.5, 0.5]},
     {"type": "cylinder", "position": [1.5, -1.0, 0.30], "size": [0.5, 0.5, 0.6]},
-    {"type": "box",      "position": [-1.0, 1.2, 0.20], "size": [0.4, 0.4, 0.4]}
+    {"type": "cuboid",   "position": [-1.0, 1.2, 0.20], "size": [0.4, 0.4, 0.4]}
   ],
   "target_cube": {
     "size": [0.05, 0.05, 0.20],
