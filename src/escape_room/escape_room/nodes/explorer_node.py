@@ -16,7 +16,7 @@ State sequence:
       → pickup_open → pickup_align → pickup_close
       → go_to_plate
       → drop_align → drop_open → drop_backup
-      → go_to_door
+      → go_to_door → exit_drive
       → done
 """
 
@@ -172,7 +172,9 @@ class ExplorerNode(Node):
         p("map_frame", "map")
         p("base_frame", "base_link")
         p("control_rate_hz", 4.0)
-        p("door_push_m", 0.6)
+        p("door_threshold_inset_m", 0.20)
+        p("exit_drive_speed_mps", 0.10)
+        p("exit_drive_duration_s", 5.0)
         p("pickup_standoff_m", 0.50)
         # 0.0 = auto-detect from the model's attachPoint at startup.
         p("pickup_engage_dist_m", 0.0)
@@ -192,7 +194,9 @@ class ExplorerNode(Node):
 
         self._map_frame = g("map_frame")
         self._base_frame = g("base_frame")
-        self.door_push = float(g("door_push_m"))
+        self.door_threshold_inset = float(g("door_threshold_inset_m"))
+        self.exit_drive_speed = float(g("exit_drive_speed_mps"))
+        self.exit_drive_duration = float(g("exit_drive_duration_s"))
         self.pickup_standoff = float(g("pickup_standoff_m"))
         self.pickup_engage_dist = float(g("pickup_engage_dist_m"))
         self.pickup_engage_dist_tol = float(g("pickup_engage_dist_tol_m"))
@@ -271,6 +275,7 @@ class ExplorerNode(Node):
             "drop_open": self._tick_gripper_wait,
             "drop_align": self._tick_drop_align,
             "drop_backup": self._tick_drop_backup,
+            "exit_drive": self._tick_exit_drive,
             "done": self._stop,
         }
 
@@ -327,8 +332,8 @@ class ExplorerNode(Node):
         elif self.mode == "go_to_plate":
             self._begin_drop()
         elif self.mode == "go_to_door":
-            self._enter("done")
-            self._stop()
+            self._enter("exit_drive")
+            self.action_t = self._clock_s()
 
     def _send_frontier_goal(self) -> None:
         """Navigate to the nearest unexplored frontier on the current map."""
@@ -484,6 +489,23 @@ class ExplorerNode(Node):
         twist.linear.x = -self.backup_speed
         self.cmd_pub.publish(twist)
 
+    # ===== exit substate =============================================
+
+    def _tick_exit_drive(self) -> None:
+        """Drive forward at constant cmd_vel to cross the door threshold.
+
+        Nav2 stopped us just inside the door facing outward; this state
+        crosses the wall opening, which lies in unmapped/unknown space
+        that Nav2 won't plan into.
+        """
+        if self._clock_s() - self.action_t >= self.exit_drive_duration:
+            self._stop()
+            self._enter("done")
+            return
+        twist = Twist()
+        twist.linear.x = self.exit_drive_speed
+        self.cmd_pub.publish(twist)
+
     # ===== gripper-wait substates ====================================
 
     def _tick_gripper_wait(self) -> None:
@@ -528,9 +550,14 @@ class ExplorerNode(Node):
             self._publish_nav_goal_path(px, py)
             self._nav.send(px, py)
         elif mode == "go_to_door":
-            dx, dy = self._door_exit_xy()
-            self._publish_nav_goal_path(dx, dy)
-            self._nav.send(dx, dy)
+            tx, ty, yaw = self._door_threshold_xy_yaw()
+            door_xy = self.targets["door"]
+            self.get_logger().info(
+                f"door target=({door_xy[0]:.2f}, {door_xy[1]:.2f}); "
+                f"threshold goal=({tx:.2f}, {ty:.2f}, yaw={math.degrees(yaw):+.0f}°)"
+            )
+            self._publish_nav_goal_path(tx, ty)
+            self._nav.send(tx, ty, yaw=yaw)
 
     def _stop(self) -> None:
         self.cmd_pub.publish(Twist())
@@ -567,12 +594,27 @@ class ExplorerNode(Node):
     def _clock_s(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
-    def _door_exit_xy(self) -> tuple[float, float]:
+    def _door_threshold_xy_yaw(self) -> tuple[float, float, float]:
+        """Approach pose just before the door, facing outward.
+
+        Uses the *robot-to-door* direction instead of the radial-from-map-origin
+        one — slam_toolbox's map frame origin sits at the robot's start pose,
+        not at the room centre, so radial direction is wrong in general.
+        """
         dx, dy = self.targets["door"]
-        n = math.hypot(dx, dy)
+        pose = self._get_robot_pose()
+        if pose is None:
+            return dx, dy, 0.0
+        rx, ry, _ = pose
+        vx, vy = dx - rx, dy - ry
+        n = math.hypot(vx, vy)
         if n < 1e-3:
-            return dx, dy
-        return dx + self.door_push * dx / n, dy + self.door_push * dy / n
+            return dx, dy, 0.0
+        vx, vy = vx / n, vy / n
+        tx = dx - self.door_threshold_inset * vx
+        ty = dy - self.door_threshold_inset * vy
+        yaw = math.atan2(vy, vx)
+        return tx, ty, yaw
 
     @staticmethod
     def _find_in_tree(sim, root_h: int, alias: str) -> int:
