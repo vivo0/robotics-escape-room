@@ -60,17 +60,21 @@ def clamp(x: float, lo: float, hi: float) -> float:
 
 
 class GripperIO:
-    """Stateless ZMQ wrapper for gripper open/close.
+    """Stateless ZMQ wrapper for gripper open/close + cube lidar
+    visibility toggling.
 
     The cube is held by physical contact (friction) — there is no
-    parent/child shortcut. build_scene.py sets the cube light and
-    cranks finger friction to make the grasp stable.
+    parent/child shortcut. We do, however, hide the cube from the
+    lidar while it's carried: otherwise the local costmap sees a
+    stationary obstacle right in front of base_link and Nav2's
+    controller refuses to advance.
     """
 
-    def __init__(self, sim, gripper_script_h: int) -> None:
-        """Initialise with CoppeliaSim sim handle and gripper script handle."""
+    def __init__(self, sim, gripper_script_h: int, cube_h: int) -> None:
+        """Initialise with sim handle, gripper script handle, cube handle."""
         self._sim = sim
         self._script_h = gripper_script_h
+        self._cube_h = cube_h
 
     def open(self) -> None:
         """Command gripper to open."""
@@ -87,6 +91,16 @@ class GripperIO:
             return True
         cur = self._sim.callScriptFunction("_ext_get_state", self._script_h)
         return cur is not None and int(cur) == target
+
+    def hide_cube_from_lidar(self) -> None:
+        """Clear detectable flags so the carried cube doesn't show up in /scan."""
+        self._sim.setObjectSpecialProperty(self._cube_h, 0)
+
+    def show_cube_to_lidar(self) -> None:
+        """Restore detectable flags (cube becomes a navigation obstacle again)."""
+        self._sim.setObjectSpecialProperty(
+            self._cube_h, self._sim.objectspecialproperty_detectable_all
+        )
 
 
 # ── NavClient ─────────────────────────────────────────────────────────────
@@ -169,6 +183,7 @@ class ExplorerNode(Node):
         # ----- parameters --------------------------------------------
         p = self.declare_parameter
         p("robot_alias", "/RoboMasterEP/BaseLinkFrame")
+        p("cube_alias", "/TargetCube")
         p("map_frame", "map")
         p("base_frame", "base_link")
         p("control_rate_hz", 4.0)
@@ -210,14 +225,15 @@ class ExplorerNode(Node):
         self.align_max_omega = float(g("align_max_omega"))
         self.gripper_timeout = float(g("gripper_timeout_s"))
 
-        # ----- ZMQ (gripper open/close only) -------------------------
+        # ----- ZMQ (gripper open/close + cube lidar visibility) -----
         sim = RemoteAPIClient().require("sim")
         robot_alias = g("robot_alias")
         model_alias = "/" + robot_alias.lstrip("/").split("/")[0]
         model_h = sim.getObject(model_alias)
         gripper_h = self._find_in_tree(sim, model_h, "gripper_link_respondable")
         script_h = sim.getScript(1, gripper_h)
-        self._gripper = GripperIO(sim, script_h)
+        cube_h = sim.getObject(g("cube_alias"))
+        self._gripper = GripperIO(sim, script_h, cube_h)
 
         # Auto-detect engage distance from attachPoint position. The
         # attachPoint sits between the gripper fingers, so the cube ends
@@ -519,10 +535,12 @@ class ExplorerNode(Node):
         elif self.mode == "pickup_close" and self._gripper.reached(
             GRIPPER_CLOSE, elapsed, self.gripper_timeout, logger
         ):
+            self._gripper.hide_cube_from_lidar()
             self._enter("go_to_plate")
         elif self.mode == "drop_open" and self._gripper.reached(
             GRIPPER_OPEN, elapsed, self.gripper_timeout, logger
         ):
+            self._gripper.show_cube_to_lidar()
             self._enter("drop_backup")
             self.action_t = self._clock_s()
 
