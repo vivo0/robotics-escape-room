@@ -71,6 +71,7 @@ def generate_launch_description() -> LaunchDescription:
                 name="slam_toolbox",
                 output="screen",
                 parameters=[slam_params],
+                ros_arguments=["--log-level", "WARN"],
             ),
             # Nav2: costmap + planner + controller + BT navigator
             IncludeLaunchDescription(
@@ -81,6 +82,7 @@ def generate_launch_description() -> LaunchDescription:
                     "params_file": nav2_params,
                     "use_sim_time": "false",
                     "autostart": "true",
+                    "log_level": "warn",
                 }.items(),
             ),
             # HSV-based colour landmark detection → /targets/{cube,plate,door}

@@ -18,3 +18,9 @@ sim.getInt32Signal = function(name)
 end
 function _ext_set_target(state_int) _ext_target_state = state_int end
 function _ext_get_state() return _ext_current_state end
+
+-- Block the stock gripper script from reparenting grasped objects.
+-- We want the cube held by physical contact (friction), not by
+-- becoming a child of attachPoint. This override is local to the
+-- gripper script's Lua state; other scripts are unaffected.
+sim.setObjectParent = function(_obj_h, _parent_h, _keep_pose) end
