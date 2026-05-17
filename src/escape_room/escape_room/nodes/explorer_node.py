@@ -5,14 +5,15 @@ Navigation is delegated to Nav2 (NavigateToPose action).  Exploration uses
 frontier detection on the live /map occupancy grid from slam_toolbox.
 Robot pose is read from the map→base_link TF published by slam_toolbox.
 
-Gripper control still uses the CoppeliaSim ZMQ API (Lua helpers injected by
-build_scene.py), as does cube attach/detach.
+Gripper open/close uses the CoppeliaSim ZMQ API (Lua helpers injected by
+build_scene.py). The cube is held by physical contact — no reparenting —
+so build_scene.py tunes its mass and friction for a stable grasp.
 
 State sequence:
 
     explore
       → go_to_key
-      → pickup_open → pickup_align → pickup_drive → pickup_close
+      → pickup_open → pickup_align → pickup_close
       → go_to_plate
       → drop_align → drop_open → drop_backup
       → go_to_door
@@ -59,14 +60,17 @@ def clamp(x: float, lo: float, hi: float) -> float:
 
 
 class GripperIO:
-    """Stateless ZMQ wrapper for gripper open/close and cube attach/detach."""
+    """Stateless ZMQ wrapper for gripper open/close.
 
-    def __init__(self, sim, gripper_script_h: int, cube_h: int, attach_h: int) -> None:
-        """Initialise with CoppeliaSim sim handle and pre-resolved object handles."""
+    The cube is held by physical contact (friction) — there is no
+    parent/child shortcut. build_scene.py sets the cube light and
+    cranks finger friction to make the grasp stable.
+    """
+
+    def __init__(self, sim, gripper_script_h: int) -> None:
+        """Initialise with CoppeliaSim sim handle and gripper script handle."""
         self._sim = sim
         self._script_h = gripper_script_h
-        self._cube_h = cube_h
-        self._attach_h = attach_h
 
     def open(self) -> None:
         """Command gripper to open."""
@@ -83,16 +87,6 @@ class GripperIO:
             return True
         cur = self._sim.callScriptFunction("_ext_get_state", self._script_h)
         return cur is not None and int(cur) == target
-
-    def attach_cube(self) -> None:
-        """Parent cube to gripper attach point."""
-        self._sim.setObjectParent(self._cube_h, self._attach_h, True)
-        self._sim.resetDynamicObject(self._cube_h)
-
-    def detach_cube(self) -> None:
-        """Release cube to world frame."""
-        self._sim.setObjectParent(self._cube_h, -1, True)
-        self._sim.resetDynamicObject(self._cube_h)
 
 
 # ── NavClient ─────────────────────────────────────────────────────────────
@@ -175,16 +169,14 @@ class ExplorerNode(Node):
         # ----- parameters --------------------------------------------
         p = self.declare_parameter
         p("robot_alias", "/RoboMasterEP/BaseLinkFrame")
-        p("cube_alias", "/TargetCube")
         p("map_frame", "map")
         p("base_frame", "base_link")
         p("control_rate_hz", 4.0)
         p("door_push_m", 0.6)
         p("pickup_standoff_m", 0.50)
-        p("pickup_engage_dist_m", 0.15)
+        # 0.0 = auto-detect from the model's attachPoint at startup.
+        p("pickup_engage_dist_m", 0.0)
         p("pickup_engage_dist_tol_m", 0.03)
-        p("engage_speed_mps", 0.05)
-        p("engage_duration_s", 0.4)
         p("drop_backup_speed_mps", 0.05)
         p("drop_backup_duration_s", 8.0)
         p("plate_drop_distance_m", 0.30)
@@ -204,8 +196,6 @@ class ExplorerNode(Node):
         self.pickup_standoff = float(g("pickup_standoff_m"))
         self.pickup_engage_dist = float(g("pickup_engage_dist_m"))
         self.pickup_engage_dist_tol = float(g("pickup_engage_dist_tol_m"))
-        self.engage_speed = float(g("engage_speed_mps"))
-        self.engage_duration = float(g("engage_duration_s"))
         self.backup_speed = float(g("drop_backup_speed_mps"))
         self.backup_duration = float(g("drop_backup_duration_s"))
         self.drop_distance = float(g("plate_drop_distance_m"))
@@ -216,16 +206,28 @@ class ExplorerNode(Node):
         self.align_max_omega = float(g("align_max_omega"))
         self.gripper_timeout = float(g("gripper_timeout_s"))
 
-        # ----- ZMQ (gripper + cube attach only) ----------------------
+        # ----- ZMQ (gripper open/close only) -------------------------
         sim = RemoteAPIClient().require("sim")
         robot_alias = g("robot_alias")
         model_alias = "/" + robot_alias.lstrip("/").split("/")[0]
         model_h = sim.getObject(model_alias)
-        cube_h = sim.getObject(g("cube_alias"))
-        attach_h = self._find_in_tree(sim, model_h, "attachPoint")
         gripper_h = self._find_in_tree(sim, model_h, "gripper_link_respondable")
         script_h = sim.getScript(1, gripper_h)
-        self._gripper = GripperIO(sim, script_h, cube_h, attach_h)
+        self._gripper = GripperIO(sim, script_h)
+
+        # Auto-detect engage distance from attachPoint position. The
+        # attachPoint sits between the gripper fingers, so the cube ends
+        # up centred between them when base_link is exactly this far
+        # from the cube centre.
+        if self.pickup_engage_dist <= 0.0:
+            attach_h = self._find_in_tree(sim, model_h, "attachPoint")
+            base_h = self._find_in_tree(sim, model_h, "BaseLinkFrame")
+            off = sim.getObjectPosition(attach_h, base_h)
+            self.pickup_engage_dist = float(off[0])
+            self.get_logger().info(
+                f"auto-detected pickup_engage_dist = {self.pickup_engage_dist:.3f} m "
+                f"(attachPoint x-offset from BaseLinkFrame)"
+            )
 
         # ----- TF (robot pose in map frame) --------------------------
         self._tf_buffer = tf2_ros.Buffer()
@@ -265,7 +267,6 @@ class ExplorerNode(Node):
             "go_to_door": self._tick_navigate,
             "pickup_open": self._tick_gripper_wait,
             "pickup_align": self._tick_pickup_align,
-            "pickup_drive": self._tick_engage,
             "pickup_close": self._tick_gripper_wait,
             "drop_open": self._tick_gripper_wait,
             "drop_align": self._tick_drop_align,
@@ -424,25 +425,15 @@ class ExplorerNode(Node):
         dist_err = dist - self.pickup_engage_dist
         if abs(dist_err) <= self.pickup_engage_dist_tol:
             self._stop()
-            self._enter("pickup_drive")
+            self._enter("pickup_close")
             self.action_t = self._clock_s()
+            self._gripper.close()
             return
         twist = Twist()
         twist.linear.x = clamp(
             0.5 * dist_err, -self.park_max_speed, self.park_max_speed
         )
         twist.angular.z = 0.5 * yaw_err
-        self.cmd_pub.publish(twist)
-
-    def _tick_engage(self) -> None:
-        if self._clock_s() - self.action_t >= self.engage_duration:
-            self._stop()
-            self._enter("pickup_close")
-            self.action_t = self._clock_s()
-            self._gripper.close()
-            return
-        twist = Twist()
-        twist.linear.x = self.engage_speed
         self.cmd_pub.publish(twist)
 
     # ===== drop substates ============================================
@@ -506,12 +497,10 @@ class ExplorerNode(Node):
         elif self.mode == "pickup_close" and self._gripper.reached(
             GRIPPER_CLOSE, elapsed, self.gripper_timeout, logger
         ):
-            self._gripper.attach_cube()
             self._enter("go_to_plate")
         elif self.mode == "drop_open" and self._gripper.reached(
             GRIPPER_OPEN, elapsed, self.gripper_timeout, logger
         ):
-            self._gripper.detach_cube()
             self._enter("drop_backup")
             self.action_t = self._clock_s()
 

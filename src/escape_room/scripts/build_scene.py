@@ -193,7 +193,12 @@ def build_obstacle(sim, obs, idx):
 
 def build_target_cube(sim, cfg):
     """The "key" the robot must grasp. A tall thin cylinder is much
-    easier for the gripper to pick up than a flat cube."""
+    easier for the gripper to pick up than a flat cube.
+
+    Tuned for friction-only grasp (no parent reparenting): light mass,
+    high friction, and angular damping so the cube doesn't squirt out
+    of the gripper or spin when nudged.
+    """
     h = make_shape(
         sim,
         sim.primitiveshape_cylinder,
@@ -204,7 +209,30 @@ def build_target_cube(sim, cfg):
         static=False,
     )
     sim.setObjectSpecialProperty(h, sim.objectspecialproperty_detectable_all)
+    sim.setShapeMass(h, 0.02)
+    _set_high_friction(sim, h)
     return h
+
+
+def _set_high_friction(sim, h):
+    """Crank up friction across supported physics engines so the gripper
+    can hold the cube by contact alone. Each engine has its own param
+    namespace; we set whichever the running engine reads."""
+    for param in (
+        getattr(sim, "bullet_body_friction", None),
+        getattr(sim, "bullet_body_oldfriction", None),
+        getattr(sim, "ode_body_friction", None),
+        getattr(sim, "newton_body_staticfriction", None),
+        getattr(sim, "newton_body_kineticfriction", None),
+    ):
+        if param is not None:
+            sim.setEngineFloatParam(param, h, 1.0)
+    lin_damp = getattr(sim, "bullet_body_lineardamping", None)
+    ang_damp = getattr(sim, "bullet_body_angulardamping", None)
+    if lin_damp is not None:
+        sim.setEngineFloatParam(lin_damp, h, 0.2)
+    if ang_damp is not None:
+        sim.setEngineFloatParam(ang_damp, h, 0.5)
 
 
 def build_pressure_plate(sim, cfg):
@@ -272,6 +300,24 @@ def _inject_gripper_helpers(sim, robot_h, model_name):
     print(f"[builder] injected gripper helpers into {model_name} script")
 
 
+def _bump_gripper_finger_friction(sim, robot_h):
+    """Raise friction on every respondable shape under the gripper so the
+    cube can be held by contact alone (no reparenting)."""
+    count = 0
+    for h in sim.getObjectsInTree(robot_h):
+        h = int(h)
+        alias = sim.getObjectAlias(h, 0).lower()
+        if "finger" not in alias and "gripper" not in alias:
+            continue
+        if sim.getObjectType(h) != sim.object_shape_type:
+            continue
+        if not sim.getObjectInt32Param(h, sim.shapeintparam_respondable):
+            continue
+        _set_high_friction(sim, h)
+        count += 1
+    print(f"[builder] raised friction on {count} gripper shape(s)")
+
+
 def _attach_lidar_sensor(sim, robot_h):
     """Create a LidarSensor dummy as child of BaseLinkFrame and inject the Lua script."""
     base_frame_h = next(
@@ -331,6 +377,7 @@ def load_robot(sim, robot_cfg):
         sim.resetDynamicObject(h)
 
     _inject_gripper_helpers(sim, handle, model_name)
+    _bump_gripper_finger_friction(sim, handle)
     _attach_lidar_sensor(sim, handle)
     return handle
 
