@@ -12,7 +12,10 @@ def send_frontier_goal(node) -> None:
             "no frontiers; map fully explored", throttle_duration_sec=5.0
         )
         return
-    rx, ry, _ = node.get_robot_pose()
+    pose = node.get_robot_pose()
+    if pose is None:
+        return
+    rx, ry, _ = pose
     fx, fy = min(frontiers, key=lambda f: math.hypot(f[0] - rx, f[1] - ry))
     node.publish_nav_goal_path(fx, fy)
     node.nav.send(fx, fy)

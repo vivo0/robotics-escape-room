@@ -9,7 +9,10 @@ from .utils import clamp, wrap_angle
 
 def tick_pickup_align(node) -> None:
     """P-controller: face cube, approach to pickup_engage_dist, then close."""
-    rx, ry, ryaw = node.get_robot_pose()
+    pose = node.get_robot_pose()
+    if pose is None:
+        return
+    rx, ry, ryaw = pose
     cx, cy = node.targets["cube"]
     dist = math.hypot(cx - rx, cy - ry)
     target_yaw = math.atan2(cy - ry, cx - rx)

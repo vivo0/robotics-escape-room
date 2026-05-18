@@ -109,19 +109,6 @@ class DoorController(Node):
         )
         return ((xmax - xmin) / 2.0, (ymax - ymin) / 2.0, (zmax - zmin) / 2.0)
 
-    def cube_on_plate(self):
-        cube_pos = self.sim.getObjectPosition(self.cube, -1)
-        plate_pos = self.sim.getObjectPosition(self.plate, -1)
-        hx, hy = self.plate_bbox_xy
-        dx = cube_pos[0] - plate_pos[0]
-        dy = cube_pos[1] - plate_pos[1]
-        dz = cube_pos[2] - plate_pos[2]
-        return (
-            abs(dx) <= hx + self.xy_margin
-            and abs(dy) <= hy + self.xy_margin
-            and -0.05 <= dz <= self.z_max_offset
-        )
-
     def open_door(self):
         self.sim.setObjectPosition(self.door, self.door_open_pos, -1)
         try:

@@ -9,7 +9,10 @@ from .utils import clamp, wrap_angle
 
 def tick_drop_align(node) -> None:
     """P-controller: face plate, approach to drop_distance, then open."""
-    rx, ry, ryaw = node.get_robot_pose()
+    pose = node.get_robot_pose()
+    if pose is None:
+        return
+    rx, ry, ryaw = pose
     px, py = node.targets["plate"]
     dist = math.hypot(px - rx, py - ry)
     target_yaw = math.atan2(py - ry, px - rx)
