@@ -2,13 +2,13 @@
 """Mission FSM for the escape room.
 
 State sequence:
-    explore
-      → go_to_key
-      → pickup_open → pickup_align → pickup_close
-      → go_to_plate
-      → drop_align → drop_open → drop_backup
-      → go_to_door → exit_drive
-      → done
+    EXPLORE
+      → GO_TO_KEY
+      → PICKUP_OPEN → PICKUP_ALIGN → PICKUP_CLOSE
+      → GO_TO_PLATE
+      → DROP_ALIGN → DROP_OPEN → DROP_BACKUP
+      → GO_TO_DOOR → EXIT_DRIVE
+      → DONE
 """
 
 from __future__ import annotations
@@ -27,14 +27,16 @@ from rclpy.time import Time
 
 from .explorer.frontier import send_frontier_goal
 from .explorer.nav_client import NavClient
-from .explorer.phases import (
-    tick_drop_align,
-    tick_drop_backup,
-    tick_exit_drive,
-    tick_gripper_wait,
-    tick_pickup_align,
-)
-from .explorer.sim import setup_sim
+from .explorer.sim import GRIPPER_CLOSE, GRIPPER_OPEN, GripperIO, setup_sim
+from .explorer.state import State
+
+
+def _wrap(a: float) -> float:
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
 class ExplorerNode(Node):
@@ -43,7 +45,7 @@ class ExplorerNode(Node):
     def __init__(self) -> None:
         super().__init__("explorer_node")
         self._declare_params()
-        self.gripper = setup_sim(self)
+        self.gripper: GripperIO = setup_sim(self)
 
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
@@ -66,24 +68,24 @@ class ExplorerNode(Node):
         self.create_subscription(OccupancyGrid, "/map", self._on_map, latched)
 
         self.targets: dict[str, tuple[float, float]] = {}
-        self.mode = "explore"
-        self.action_t = 0.0
+        self.mode: State = State.EXPLORE
+        self.action_t: float = 0.0
         self.current_map: OccupancyGrid | None = None
-        self._started = False
+        self._started: bool = False
 
         self._handlers = {
-            "explore": self._tick_navigate,
-            "go_to_key": self._tick_navigate,
-            "go_to_plate": self._tick_navigate,
-            "go_to_door": self._tick_navigate,
-            "pickup_open": lambda: tick_gripper_wait(self),
-            "pickup_align": lambda: tick_pickup_align(self),
-            "pickup_close": lambda: tick_gripper_wait(self),
-            "drop_open": lambda: tick_gripper_wait(self),
-            "drop_align": lambda: tick_drop_align(self),
-            "drop_backup": lambda: tick_drop_backup(self),
-            "exit_drive": lambda: tick_exit_drive(self),
-            "done": self._tick_done,
+            State.EXPLORE: self._tick_explore,
+            State.GO_TO_KEY: self._tick_go_to_key,
+            State.GO_TO_PLATE: self._tick_go_to_plate,
+            State.GO_TO_DOOR: self._tick_go_to_door,
+            State.PICKUP_OPEN: self._tick_gripper_wait,
+            State.PICKUP_ALIGN: self._tick_pickup_align,
+            State.PICKUP_CLOSE: self._tick_gripper_wait,
+            State.DROP_OPEN: self._tick_gripper_wait,
+            State.DROP_ALIGN: self._tick_drop_align,
+            State.DROP_BACKUP: self._tick_drop_backup,
+            State.EXIT_DRIVE: self._tick_exit_drive,
+            State.DONE: self._tick_done,
         }
 
         self.create_timer(1.0 / self.control_rate_hz, self._tick)
@@ -171,111 +173,200 @@ class ExplorerNode(Node):
             and self.get_robot_pose() is not None
         )
 
-    def _tick_navigate(self) -> None:
-        # Immediately cancel frontier nav when all targets known
-        if self.mode == "explore" and len(self.targets) == 3:
-            self.enter("go_to_key")
-            return
+    # ===== nav-phase tick methods =====================================
 
-        if self.nav.active:
+    def _tick_explore(self) -> None:
+        if len(self.targets) == 3:
+            self._transition(State.GO_TO_KEY)
+            self._nav_go_to_key()
             return
-
-        if self.mode == "explore":
+        if not self.nav.active:
             send_frontier_goal(self)
 
-        elif self.mode == "go_to_key":
-            if not self.nav.succeeded:
-                self.get_logger().warn("go_to_key nav failed; retrying")
-                self.enter("go_to_key")
-                return
-            self.stop()
-            self.enter("pickup_open")
+    def _tick_go_to_key(self) -> None:
+        if self.nav.active:
+            return
+        if not self.nav.succeeded:
+            self.get_logger().warn("go_to_key nav failed; retrying")
+            self._nav_go_to_key()
+            return
+        self.stop()
+        self._transition(State.PICKUP_OPEN)
+        self.action_t = self.clock_s()
+        self.gripper.open()
 
-        elif self.mode == "go_to_plate":
-            if not self.nav.succeeded:
-                self.get_logger().warn("go_to_plate nav failed; retrying")
-                self.enter("go_to_plate")
-                return
-            self.stop()
-            self.enter("drop_align")
+    def _tick_go_to_plate(self) -> None:
+        if self.nav.active:
+            return
+        if not self.nav.succeeded:
+            self.get_logger().warn("go_to_plate nav failed; retrying")
+            self._nav_go_to_plate()
+            return
+        self.stop()
+        self._transition(State.DROP_ALIGN)
 
-        elif self.mode == "go_to_door":
-            if not self.nav.succeeded:
-                self.get_logger().warn("go_to_door nav failed; retrying")
-                self.enter("go_to_door")
-                return
-            self.enter("exit_drive")
+    def _tick_go_to_door(self) -> None:
+        if self.nav.active:
+            return
+        if not self.nav.succeeded:
+            self.get_logger().warn("go_to_door nav failed; retrying")
+            self._nav_go_to_door()
+            return
+        self._transition(State.EXIT_DRIVE)
+        self.action_t = self.clock_s()
 
     def _tick_done(self) -> None:
         pass
 
-    # ===== state transitions =========================================
+    # ===== gripper-wait tick (pickup_open, pickup_close, drop_open) ===
 
-    def enter(self, mode: str) -> None:
-        self.get_logger().info(f"mode: {self.mode} → {mode}")
-        self.nav.cancel()
-        self.mode = mode
-
-        if mode == "go_to_key":
-            pose = self.get_robot_pose()
-            if pose is None:
-                self.get_logger().warn("enter(go_to_key): TF unavailable, deferring")
-                self.mode = "explore"
-                return
-            rx, ry, _ = pose
-            cx, cy = self.targets["cube"]
-            yaw = math.atan2(cy - ry, cx - rx)
-            sx = cx - self.pickup_standoff * math.cos(yaw)
-            sy = cy - self.pickup_standoff * math.sin(yaw)
-            self.publish_nav_goal_path(sx, sy)
-            self.nav.send(sx, sy, yaw=yaw)
-
-        elif mode == "go_to_plate":
-            px, py = self.targets["plate"]
-            pose = self.get_robot_pose()
-            if pose is not None:
-                rx, ry, _ = pose
-                yaw = math.atan2(py - ry, px - rx)
-            else:
-                yaw = 0.0
-                self.get_logger().warn("enter(go_to_plate): TF unavailable, yaw=0.0")
-            self.publish_nav_goal_path(px, py)
-            self.nav.send(px, py, yaw=yaw)
-
-        elif mode == "go_to_door":
-            dx, dy = self.targets["door"]
-            nx, ny = self.door_normal
-            tx = dx - self.door_threshold_inset * nx
-            ty = dy - self.door_threshold_inset * ny
-            yaw = math.atan2(ny, nx)
-            self.get_logger().info(
-                f"door threshold=({tx:.2f}, {ty:.2f}, yaw={math.degrees(yaw):+.0f}°)"
-            )
-            self.publish_nav_goal_path(tx, ty)
-            self.nav.send(tx, ty, yaw=yaw)
-
-        elif mode == "pickup_open":
+    def _tick_gripper_wait(self) -> None:
+        self.stop()
+        elapsed = self.clock_s() - self.action_t
+        logger = self.get_logger()
+        if self.mode == State.PICKUP_OPEN and self.gripper.reached(
+            GRIPPER_OPEN, elapsed, self.gripper_timeout, logger
+        ):
+            self._transition(State.PICKUP_ALIGN)
+        elif self.mode == State.PICKUP_CLOSE and self.gripper.reached(
+            GRIPPER_CLOSE, elapsed, self.gripper_timeout, logger
+        ):
+            self.gripper.hide_cube_from_lidar()
+            self._transition(State.GO_TO_PLATE)
+            self._nav_go_to_plate()
+        elif self.mode == State.DROP_OPEN and self.gripper.reached(
+            GRIPPER_OPEN, elapsed, self.gripper_timeout, logger
+        ):
+            self.gripper.show_cube_to_lidar()
+            self._transition(State.DROP_BACKUP)
             self.action_t = self.clock_s()
-            self.gripper.open()
 
-        elif mode == "pickup_close":
+    # ===== align-phase tick methods ===================================
+
+    def _tick_pickup_align(self) -> None:
+        """P-controller: face cube, approach to pickup_engage_dist, then close."""
+        if self._tick_align(
+            self.targets["cube"], self.pickup_engage_dist,
+            self.pickup_engage_dist_tol, State.PICKUP_CLOSE,
+        ):
             self.action_t = self.clock_s()
             self.gripper.close()
 
-        elif mode == "drop_open":
+    def _tick_drop_align(self) -> None:
+        """P-controller: face plate, approach to drop_distance, then open gripper."""
+        if self._tick_align(
+            self.targets["plate"], self.drop_distance,
+            self.drop_dist_tol, State.DROP_OPEN,
+        ):
             self.action_t = self.clock_s()
             self.gripper.open()
 
-        elif mode == "drop_backup":
-            self.action_t = self.clock_s()
+    def _tick_align(
+        self,
+        target_xy: tuple[float, float],
+        engage_dist: float,
+        dist_tol: float,
+        next_state: State,
+    ) -> bool:
+        """Shared P-controller. Returns True when transition to next_state fires."""
+        pose = self.get_robot_pose()
+        if pose is None:
+            return False
+        rx, ry, ryaw = pose
+        tx, ty = target_xy
+        dist = math.hypot(tx - rx, ty - ry)
+        target_yaw = math.atan2(ty - ry, tx - rx)
+        yaw_err = _wrap(target_yaw - ryaw)
 
-        elif mode == "exit_drive":
-            self.action_t = self.clock_s()
+        if abs(yaw_err) > self.align_yaw_tol:
+            twist = Twist()
+            twist.angular.z = _clamp(
+                self.align_kp * yaw_err, -self.align_max_omega, self.align_max_omega
+            )
+            self.cmd_pub.publish(twist)
+            return False
 
-        elif mode == "done":
+        dist_err = dist - engage_dist
+        if abs(dist_err) <= dist_tol:
+            self.stop()
+            self._transition(next_state)
+            return True
+
+        twist = Twist()
+        twist.linear.x = _clamp(
+            0.5 * dist_err, -self.park_max_speed, self.park_max_speed
+        )
+        twist.angular.z = 0.5 * yaw_err
+        self.cmd_pub.publish(twist)
+        return False
+
+    # ===== timed-drive tick methods ===================================
+
+    def _tick_drop_backup(self) -> None:
+        if self.clock_s() - self.action_t >= self.backup_duration:
+            self.stop()
+            self._transition(State.GO_TO_DOOR)
+            self._nav_go_to_door()
+            return
+        twist = Twist()
+        twist.linear.x = -self.backup_speed
+        self.cmd_pub.publish(twist)
+
+    def _tick_exit_drive(self) -> None:
+        if self.clock_s() - self.action_t >= self.exit_drive_duration:
+            self.stop()
+            self._transition(State.DONE)
             self.get_logger().info("mission complete")
+            return
+        twist = Twist()
+        twist.linear.x = self.exit_drive_speed
+        self.cmd_pub.publish(twist)
 
-    # ===== shared helpers used by phase modules ======================
+    # ===== state transition + nav goal helpers =======================
+
+    def _transition(self, state: State) -> None:
+        self.get_logger().info(f"{self.mode} → {state}")
+        self.nav.cancel()
+        self.mode = state
+
+    def _nav_go_to_key(self) -> None:
+        pose = self.get_robot_pose()
+        if pose is None:
+            self.get_logger().warn("go_to_key: TF unavailable, nav goal deferred")
+            return
+        rx, ry, _ = pose
+        cx, cy = self.targets["cube"]
+        yaw = math.atan2(cy - ry, cx - rx)
+        sx = cx - self.pickup_standoff * math.cos(yaw)
+        sy = cy - self.pickup_standoff * math.sin(yaw)
+        self.publish_nav_goal_path(sx, sy)
+        self.nav.send(sx, sy, yaw=yaw)
+
+    def _nav_go_to_plate(self) -> None:
+        px, py = self.targets["plate"]
+        pose = self.get_robot_pose()
+        if pose is not None:
+            rx, ry, _ = pose
+            yaw = math.atan2(py - ry, px - rx)
+        else:
+            yaw = 0.0
+            self.get_logger().warn("go_to_plate: TF unavailable, yaw=0.0")
+        self.publish_nav_goal_path(px, py)
+        self.nav.send(px, py, yaw=yaw)
+
+    def _nav_go_to_door(self) -> None:
+        dx, dy = self.targets["door"]
+        nx, ny = self.door_normal
+        tx = dx - self.door_threshold_inset * nx
+        ty = dy - self.door_threshold_inset * ny
+        yaw = math.atan2(ny, nx)
+        self.get_logger().info(
+            f"door threshold=({tx:.2f}, {ty:.2f}, yaw={math.degrees(yaw):+.0f}°)"
+        )
+        self.publish_nav_goal_path(tx, ty)
+        self.nav.send(tx, ty, yaw=yaw)
+
+    # ===== shared helpers ============================================
 
     def stop(self) -> None:
         self.cmd_pub.publish(Twist())
