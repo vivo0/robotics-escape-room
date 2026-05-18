@@ -83,7 +83,7 @@ class ExplorerNode(Node):
             "drop_align": lambda: tick_drop_align(self),
             "drop_backup": lambda: tick_drop_backup(self),
             "exit_drive": lambda: tick_exit_drive(self),
-            "done": self.stop,
+            "done": self._tick_done,
         }
 
         self.create_timer(1.0 / self.control_rate_hz, self._tick)
@@ -140,13 +140,19 @@ class ExplorerNode(Node):
         self.current_map = msg
 
     def _on_target(self, name: str, msg: PoseStamped) -> None:
-        if name in self.targets:
-            return
         x, y = msg.pose.position.x, msg.pose.position.y
+        if name in self.targets:
+            ox, oy = self.targets[name]
+            if math.hypot(x - ox, y - oy) <= 0.1:
+                return
+            self.get_logger().info(
+                f"target '{name}' updated ({ox:.2f},{oy:.2f})→({x:.2f},{y:.2f})"
+            )
+        else:
+            self.get_logger().info(
+                f"saw '{name}' at ({x:.2f}, {y:.2f}) [{len(self.targets) + 1}/3]"
+            )
         self.targets[name] = (x, y)
-        self.get_logger().info(
-            f"saw '{name}' at ({x:.2f}, {y:.2f}) [{len(self.targets)}/3]"
-        )
 
     # ===== FSM dispatcher ============================================
 
@@ -166,24 +172,42 @@ class ExplorerNode(Node):
         )
 
     def _tick_navigate(self) -> None:
+        # Immediately cancel frontier nav when all targets known
+        if self.mode == "explore" and len(self.targets) == 3:
+            self.enter("go_to_key")
+            return
+
         if self.nav.active:
             return
+
         if self.mode == "explore":
-            if len(self.targets) == 3:
-                self.enter("go_to_key")
-            else:
-                send_frontier_goal(self)
+            send_frontier_goal(self)
+
         elif self.mode == "go_to_key":
+            if not self.nav.succeeded:
+                self.get_logger().warn("go_to_key nav failed; retrying")
+                self.enter("go_to_key")
+                return
             self.stop()
             self.enter("pickup_open")
-            self.action_t = self.clock_s()
-            self.gripper.open()
+
         elif self.mode == "go_to_plate":
+            if not self.nav.succeeded:
+                self.get_logger().warn("go_to_plate nav failed; retrying")
+                self.enter("go_to_plate")
+                return
             self.stop()
             self.enter("drop_align")
+
         elif self.mode == "go_to_door":
+            if not self.nav.succeeded:
+                self.get_logger().warn("go_to_door nav failed; retrying")
+                self.enter("go_to_door")
+                return
             self.enter("exit_drive")
-            self.action_t = self.clock_s()
+
+    def _tick_done(self) -> None:
+        pass
 
     # ===== state transitions =========================================
 
@@ -191,18 +215,33 @@ class ExplorerNode(Node):
         self.get_logger().info(f"mode: {self.mode} → {mode}")
         self.nav.cancel()
         self.mode = mode
+
         if mode == "go_to_key":
+            pose = self.get_robot_pose()
+            if pose is None:
+                self.get_logger().warn("enter(go_to_key): TF unavailable, deferring")
+                self.mode = "explore"
+                return
+            rx, ry, _ = pose
             cx, cy = self.targets["cube"]
-            rx, ry, _ = self.get_robot_pose()
             yaw = math.atan2(cy - ry, cx - rx)
             sx = cx - self.pickup_standoff * math.cos(yaw)
             sy = cy - self.pickup_standoff * math.sin(yaw)
             self.publish_nav_goal_path(sx, sy)
             self.nav.send(sx, sy, yaw=yaw)
+
         elif mode == "go_to_plate":
             px, py = self.targets["plate"]
+            pose = self.get_robot_pose()
+            if pose is not None:
+                rx, ry, _ = pose
+                yaw = math.atan2(py - ry, px - rx)
+            else:
+                yaw = 0.0
+                self.get_logger().warn("enter(go_to_plate): TF unavailable, yaw=0.0")
             self.publish_nav_goal_path(px, py)
-            self.nav.send(px, py)
+            self.nav.send(px, py, yaw=yaw)
+
         elif mode == "go_to_door":
             dx, dy = self.targets["door"]
             nx, ny = self.door_normal
@@ -214,6 +253,27 @@ class ExplorerNode(Node):
             )
             self.publish_nav_goal_path(tx, ty)
             self.nav.send(tx, ty, yaw=yaw)
+
+        elif mode == "pickup_open":
+            self.action_t = self.clock_s()
+            self.gripper.open()
+
+        elif mode == "pickup_close":
+            self.action_t = self.clock_s()
+            self.gripper.close()
+
+        elif mode == "drop_open":
+            self.action_t = self.clock_s()
+            self.gripper.open()
+
+        elif mode == "drop_backup":
+            self.action_t = self.clock_s()
+
+        elif mode == "exit_drive":
+            self.action_t = self.clock_s()
+
+        elif mode == "done":
+            self.get_logger().info("mission complete")
 
     # ===== shared helpers used by phase modules ======================
 

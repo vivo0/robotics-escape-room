@@ -17,10 +17,17 @@ class NavClient:
         self._client = ActionClient(node, NavigateToPose, "navigate_to_pose")
         self._active = False
         self._handle = None
+        self._succeeded: bool = False
+        self._canceled: bool = False
 
     @property
     def active(self) -> bool:
         return self._active
+
+    @property
+    def succeeded(self) -> bool:
+        """True iff the last completed goal finished with STATUS_SUCCEEDED."""
+        return self._succeeded
 
     @property
     def server_ready(self) -> bool:
@@ -38,15 +45,19 @@ class NavClient:
         goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
         goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
         self._active = True
+        self._succeeded = False
+        self._canceled = False
         future = self._client.send_goal_async(goal)
         future.add_done_callback(self._on_goal_accepted)
         return True
 
     def cancel(self) -> None:
         if self._handle is not None:
+            self._canceled = True
             self._handle.cancel_goal_async()
         self._active = False
         self._handle = None
+        self._succeeded = False
 
     def _on_goal_accepted(self, future) -> None:
         handle = future.result()
@@ -61,5 +72,8 @@ class NavClient:
         status = future.result().status
         self._active = False
         self._handle = None
+        self._succeeded = (status == GoalStatus.STATUS_SUCCEEDED)
         if status != GoalStatus.STATUS_SUCCEEDED:
-            self._node.get_logger().warn(f"Nav2 goal finished with status {status}")
+            if not (self._canceled and status == GoalStatus.STATUS_CANCELED):
+                self._node.get_logger().warn(f"Nav2 goal finished with status {status}")
+        self._canceled = False
