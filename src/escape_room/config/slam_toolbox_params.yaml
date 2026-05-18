@@ -31,9 +31,11 @@ slam_toolbox:
     use_scan_barycenter: true
     minimum_time_interval: 0.05
 
-    # Loop closure (small room — keep short horizon)
+    # Loop closure disabled — room is small enough that odometry drift
+    # over one exploration pass is negligible; loop closure only causes
+    # a large map-frame jump that corrupts the Nav2 costmap.
     loop_search_maximum_distance: 3.0
-    do_loop_closing: true
+    do_loop_closing: false
     loop_match_minimum_chain_size: 10
     loop_match_maximum_variance_covariance: 3.0
     loop_match_minimum_response_coarse: 0.35
