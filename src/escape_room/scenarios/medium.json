@@ -9,8 +9,8 @@
     ]
   },
   "robot": {
-    "model": "RoboMasterEP",
-    "model_path": "src/escape_room/models/RoboMasterEP.ttm",
+    "name": "RoboMasterEP",
+    "model_path": "src/escape_room/models/robomaster_ep_tof_v2.ttm",
     "position": [-2.0, -1.5, 0.05],
     "orientation": [0, 0, 90]
   },

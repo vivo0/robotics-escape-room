@@ -260,7 +260,7 @@ def _resolve_model_path(robot_cfg, sim):
             raise FileNotFoundError(f"robot model not found: {path}")
         return str(path)
     coppelia_root = sim.getStringParam(sim.stringparam_scenedefaultdir)
-    return f"{coppelia_root}/../models/robots/mobile/{robot_cfg['model']}.ttm"
+    return f"{coppelia_root}/../models/robots/mobile/{robot_cfg['name']}.ttm"
 
 
 # Lua scripts loaded once at import time; paths are relative to this file.
@@ -352,8 +352,8 @@ def _attach_lidar_sensor(sim, robot_h):
 def load_robot(sim, robot_cfg):
     """Load a RoboMaster model, place it, and inject the gripper
     helpers needed by the explorer node. The in-scene alias is set
-    to ``robot_cfg['model']`` so downstream code can resolve it."""
-    model_name = robot_cfg.get("model", "RoboMasterEP")
+    to ``robot_cfg['name']`` so downstream code can resolve it."""
+    model_name = robot_cfg.get("name", "RoboMasterEP")
     model_path = _resolve_model_path(robot_cfg, sim)
 
     handle = sim.loadModel(model_path)
@@ -435,7 +435,7 @@ def main(scenario_path: str) -> None:
         build_pressure_plate(sim, cfg["pressure_plate"])
 
     if "robot" in cfg:
-        print(f"[builder] loading robot {cfg['robot']['model']}...")
+        print(f"[builder] loading robot {cfg['robot']['name']}...")
         load_robot(sim, cfg["robot"])
 
     print("[builder] done. Scene ready.")
