@@ -23,8 +23,6 @@ set -euo pipefail
 
 SCENARIO="${1:-src/escape_room/scenarios/easy.json}"
 
-# Kill any leftover nodes from a previous run to avoid duplicate TF publishers.
-echo "[run] Killing previous escape_room processes..."
 _KILL_PATTERNS=(
     "discovery.launch.py"
     "escape_room.nodes"
@@ -35,18 +33,21 @@ _KILL_PATTERNS=(
     "robomaster_driver"
     "robot_state_publisher"
     "joint_state_publisher"
+    "door_controller"
 )
-for pat in "${_KILL_PATTERNS[@]}"; do
-    pkill -f "$pat" 2>/dev/null || true
-done
-sleep 2
-# SIGKILL any survivors that ignored SIGTERM.
-for pat in "${_KILL_PATTERNS[@]}"; do
-    pkill -9 -f "$pat" 2>/dev/null || true
-done
-# Reset ROS2 daemon so stale node registrations don't persist.
-ros2 daemon stop 2>/dev/null || true
-sleep 0.5
+
+kill_all() {
+    trap - EXIT INT TERM
+    echo "[run] Stopping all escape_room processes..."
+    for pat in "${_KILL_PATTERNS[@]}"; do
+        pkill -f "$pat" 2>/dev/null || true
+    done
+    sleep 2
+    for pat in "${_KILL_PATTERNS[@]}"; do
+        pkill -9 -f "$pat" 2>/dev/null || true
+    done
+}
+
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_ROOT"
@@ -131,4 +132,5 @@ ros2 run escape_room door_controller >/tmp/door_controller.log 2>&1 &
 
 # 8. Discovery launch in the foreground (mapper + static TF)
 echo "[run] Launching discovery (mapper + velodyne TF). Ctrl-C to stop..."
+trap 'kill_all' EXIT INT TERM
 ros2 launch escape_room discovery.launch.py
