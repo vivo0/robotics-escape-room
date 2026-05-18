@@ -85,13 +85,6 @@ def generate_launch_description() -> LaunchDescription:
                     "log_level": "warn",
                 }.items(),
             ),
-            # HSV-based colour landmark detection → /targets/{cube,plate,door}
-            Node(
-                package="escape_room",
-                executable="color_detector_node",
-                name="color_detector_node",
-                output="screen",
-            ),
             # Mission FSM: sends NavigateToPose goals + drives gripper via ZMQ
             Node(
                 package="escape_room",

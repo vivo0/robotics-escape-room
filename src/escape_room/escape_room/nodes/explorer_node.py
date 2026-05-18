@@ -41,6 +41,7 @@ from nav_msgs.msg import OccupancyGrid
 from nav_msgs.msg import Path as PathMsg
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+from visualization_msgs.msg import Marker, MarkerArray
 
 from .explorer.door import door_threshold_xy_yaw
 from .explorer.drop import tick_drop_align, tick_drop_backup
@@ -73,16 +74,11 @@ class ExplorerNode(Node):
         )
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self.path_pub = self.create_publisher(PathMsg, "/exploration/path", 10)
-        for name in ("cube", "plate", "door"):
-            self.create_subscription(
-                PoseStamped,
-                f"/targets/{name}",
-                lambda m, n=name: self._on_target(n, m),
-                latched,
-            )
+        marker_pub = self.create_publisher(MarkerArray, "/targets/markers", latched)
         self.create_subscription(OccupancyGrid, "/map", self._on_map, latched)
+        self._publish_target_markers(marker_pub)
 
-        self.targets: dict[str, tuple[float, float]] = {}
+        self.targets: dict[str, tuple[float, float]] = dict(self.sim_targets)
         self.mode = "explore"
         self.action_t = 0.0
         self.current_map: OccupancyGrid | None = None
@@ -111,15 +107,6 @@ class ExplorerNode(Node):
     def _on_map(self, msg: OccupancyGrid) -> None:
         self.current_map = msg
 
-    def _on_target(self, name: str, msg: PoseStamped) -> None:
-        if name in self.targets:
-            return
-        x, y = msg.pose.position.x, msg.pose.position.y
-        self.targets[name] = (x, y)
-        self.get_logger().info(
-            f"saw '{name}' at ({x:.2f}, {y:.2f}) [{len(self.targets)}/3]"
-        )
-
     # ===== FSM dispatcher ============================================
 
     def _tick(self) -> None:
@@ -142,10 +129,8 @@ class ExplorerNode(Node):
         if self.nav.active:
             return
         if self.mode == "explore":
-            if len(self.targets) == 3:
+            if not send_frontier_goal(self):
                 self.enter("go_to_key")
-            else:
-                send_frontier_goal(self)
         elif self.mode == "go_to_key":
             self.stop()
             self.enter("pickup_open")
@@ -168,10 +153,8 @@ class ExplorerNode(Node):
             cx, cy = self.targets["cube"]
             rx, ry, _ = self.get_robot_pose()
             yaw = math.atan2(cy - ry, cx - rx)
-            sx = cx - self.pickup_standoff * math.cos(yaw)
-            sy = cy - self.pickup_standoff * math.sin(yaw)
-            self.publish_nav_goal_path(sx, sy)
-            self.nav.send(sx, sy, yaw=yaw)
+            self.publish_nav_goal_path(cx, cy)
+            self.nav.send(cx, cy, yaw=yaw)
         elif mode == "go_to_plate":
             px, py = self.targets["plate"]
             self.publish_nav_goal_path(px, py)
@@ -187,6 +170,46 @@ class ExplorerNode(Node):
             self.nav.send(tx, ty, yaw=yaw)
 
     # ===== shared helpers used by phase modules ======================
+
+    def _publish_target_markers(self, pub) -> None:
+        colors = {
+            "cube":  (0.9, 0.1, 0.9),
+            "plate": (0.1, 1.0, 0.1),
+            "door":  (0.1, 0.3, 1.0),
+        }
+        stamp = self.get_clock().now().to_msg()
+        arr = MarkerArray()
+        for i, (name, (mx, my)) in enumerate(self.sim_targets.items()):
+            m = Marker()
+            m.header.frame_id = self.map_frame
+            m.header.stamp = stamp
+            m.ns = "targets"
+            m.id = i * 2
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = mx
+            m.pose.position.y = my
+            m.pose.position.z = 0.3
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = m.scale.z = 0.18
+            r, g, b = colors[name]
+            m.color.r, m.color.g, m.color.b, m.color.a = r, g, b, 0.85
+            arr.markers.append(m)
+            t = Marker()
+            t.header = m.header
+            t.ns = "target_labels"
+            t.id = i * 2 + 1
+            t.type = Marker.TEXT_VIEW_FACING
+            t.action = Marker.ADD
+            t.pose.position.x = mx
+            t.pose.position.y = my
+            t.pose.position.z = 0.6
+            t.pose.orientation.w = 1.0
+            t.scale.z = 0.18
+            t.color.r = t.color.g = t.color.b = t.color.a = 1.0
+            t.text = name
+            arr.markers.append(t)
+        pub.publish(arr)
 
     def stop(self) -> None:
         self.cmd_pub.publish(Twist())

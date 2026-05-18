@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-SCENARIO="${1:-src/escape_room/scenarios/easy.json}"
+SCENARIO="${1:-src/escape_room/scenarios/medium.json}"
 
 _KILL_PATTERNS=(
     "discovery.launch.py"
