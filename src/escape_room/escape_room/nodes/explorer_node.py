@@ -25,7 +25,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.time import Time
 
-from .explorer.frontier import send_frontier_goal
+from .explorer.frontier import compute_frontiers
 from .explorer.nav_client import NavClient
 from .explorer.sim import GRIPPER_CLOSE, GRIPPER_OPEN, GripperIO, setup_sim
 from .explorer.state import State
@@ -180,8 +180,21 @@ class ExplorerNode(Node):
             self._transition(State.GO_TO_KEY)
             self._nav_go_to_key()
             return
-        if not self.nav.active:
-            send_frontier_goal(self)
+        if self.nav.active:
+            return
+        frontiers = compute_frontiers(self.current_map)
+        if not frontiers:
+            self.get_logger().info(
+                "no frontiers; map fully explored", throttle_duration_sec=5.0
+            )
+            return
+        pose = self.get_robot_pose()
+        if pose is None:
+            return
+        rx, ry, _ = pose
+        fx, fy = min(frontiers, key=lambda f: math.hypot(f[0] - rx, f[1] - ry))
+        self.publish_nav_goal_path(fx, fy)
+        self.nav.send(fx, fy)
 
     def _tick_go_to_key(self) -> None:
         if self.nav.active:
