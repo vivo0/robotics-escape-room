@@ -103,6 +103,11 @@ echo "[run] Starting simulation..."
 python - <<'PY'
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 sim = RemoteAPIClient().require('sim')
+# Real-time mode required: robomaster_sim has a 3-second simulation-time
+# heartbeat watchdog. Without real-time mode the sim runs ~3x faster than
+# wall clock, so the driver's 1 Hz heartbeat times out in ~1 real second,
+# dropping all chassis topics (/odom, /imu, position) permanently.
+sim.setBoolParam(sim.boolparam_realtime_simulation, True)
 if sim.getSimulationState() == sim.simulation_stopped:
     sim.startSimulation()
 PY

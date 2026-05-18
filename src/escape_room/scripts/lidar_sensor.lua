@@ -11,8 +11,6 @@
 --
 -- Publishes:
 --   /scan              (sensor_msgs/msg/LaserScan, 10 Hz, frame laser_link)
---   /odom              (nav_msgs/msg/Odometry, 10 Hz, ground-truth pose+vel)
---   odom→base_link TF  (dynamic, every scan tick, ground-truth from CoppeliaSim)
 
 -- Explicitly load required modules to resolve warnings
 sim = require('sim')
@@ -26,7 +24,6 @@ local LASER_Z     = 0.12       -- sensor height above base_link origin (m)
 local LASER_FRAME = 'laser_link'
 
 local scanPub      = nil
-local odomPub      = nil
 local sensorHandle = nil        -- Ray-type proximity sensor (created at init)
 local drawHandle   = nil        -- Drawing object for scan visualization
 local robotHandle  = nil        -- BaseLinkFrame (pose source)
@@ -60,7 +57,6 @@ function sysCall_init()
     )
 
     scanPub = simROS2.createPublisher('/scan', 'sensor_msgs/msg/LaserScan')
-    odomPub = simROS2.createPublisher('/odom', 'nav_msgs/msg/Odometry')
 end
 
 function sysCall_sensing()
@@ -120,49 +116,6 @@ function sysCall_sensing()
         ranges          =  ranges,
     })
 
-    -- Broadcast odom→base_link from CoppeliaSim ground-truth pose.
-    -- robomaster_ros publishes /odom topic but does not reliably publish
-    -- this TF in simulation; without it slam_toolbox and Nav2 have no odom frame.
-    local p = sim.getObjectPosition(robotHandle, -1)
-    local q = sim.getObjectQuaternion(robotHandle, -1)
-    simROS2.sendTransform({
-        header         = {stamp = stamp, frame_id = 'odom'},
-        child_frame_id = 'base_link',
-        transform      = {
-            translation = {x = p[1], y = p[2], z = p[3]},
-            rotation    = {x = q[1], y = q[2], z = q[3], w = q[4]},
-        },
-    })
-
-    -- Publish /odom topic (nav_msgs/Odometry) — Nav2 requires this in addition to the TF.
-    -- Velocity: world-frame from sim, rotated to body frame (base_link).
-    local lv, av = sim.getObjectVelocity(robotHandle)
-    local cyaw = math.cos(yaw)
-    local syaw = math.sin(yaw)
-    local vx_body =  cyaw * lv[1] + syaw * lv[2]
-    local vy_body = -syaw * lv[1] + cyaw * lv[2]
-    local zero36 = {
-        0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0,
-        0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0,
-    }
-    simROS2.publish(odomPub, {
-        header         = {stamp = stamp, frame_id = 'odom'},
-        child_frame_id = 'base_link',
-        pose = {
-            pose = {
-                position    = {x = p[1], y = p[2], z = p[3]},
-                orientation = {x = q[1], y = q[2], z = q[3], w = q[4]},
-            },
-            covariance = zero36,
-        },
-        twist = {
-            twist = {
-                linear  = {x = vx_body, y = vy_body, z = 0.0},
-                angular = {x = 0.0,     y = 0.0,     z = av[3]},
-            },
-            covariance = zero36,
-        },
-    })
 end
 
 function sysCall_cleanup()
@@ -171,5 +124,4 @@ function sysCall_cleanup()
     end
     if drawHandle then sim.removeDrawingObject(drawHandle) end
     if scanPub    then simROS2.shutdownPublisher(scanPub)  end
-    if odomPub    then simROS2.shutdownPublisher(odomPub) end
 end

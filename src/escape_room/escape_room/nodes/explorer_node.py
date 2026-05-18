@@ -83,6 +83,7 @@ class ExplorerNode(Node):
         self.create_subscription(OccupancyGrid, "/map", self._on_map, latched)
 
         self.targets: dict[str, tuple[float, float]] = {}
+        self._pending_targets: dict[str, PoseStamped] = {}
         self.mode = "explore"
         self.action_t = 0.0
         self.current_map: OccupancyGrid | None = None
@@ -112,17 +113,35 @@ class ExplorerNode(Node):
         self.current_map = msg
 
     def _on_target(self, name: str, msg: PoseStamped) -> None:
-        if name in self.targets:
-            return
-        self.targets[name] = (msg.pose.position.x, msg.pose.position.y)
-        self.get_logger().info(
-            f"saw '{name}' at ({self.targets[name][0]:.2f}, "
-            f"{self.targets[name][1]:.2f}) [{len(self.targets)}/3]"
-        )
+        if name not in self.targets:
+            self._pending_targets[name] = msg
+            self._resolve_pending_targets()
+
+    def _resolve_pending_targets(self) -> None:
+        for name, msg in list(self._pending_targets.items()):
+            try:
+                t = self._tf_buffer.lookup_transform(
+                    self.map_frame, msg.header.frame_id, rclpy.time.Time())
+                qz = t.transform.rotation.z
+                qw = t.transform.rotation.w
+                yaw = 2.0 * math.atan2(qz, qw)
+                c, s = math.cos(yaw), math.sin(yaw)
+                px, py = msg.pose.position.x, msg.pose.position.y
+                x = c * px - s * py + t.transform.translation.x
+                y = s * px + c * py + t.transform.translation.y
+            except Exception:
+                continue
+            self.targets[name] = (x, y)
+            del self._pending_targets[name]
+            self.get_logger().info(
+                f"saw '{name}' at ({x:.2f}, {y:.2f}) [{len(self.targets)}/3]"
+            )
 
     # ===== FSM dispatcher ============================================
 
     def _tick(self) -> None:
+        if self._pending_targets:
+            self._resolve_pending_targets()
         if not self._started:
             if self._is_ready():
                 self._started = True

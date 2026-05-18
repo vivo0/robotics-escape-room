@@ -81,10 +81,22 @@ class ColorDetectorNode(Node):
 
         self.declare_parameter('image_topic', '/camera/image_color')
         self.declare_parameter('target_frame', 'odom')
+        self.declare_parameter('spawn_x',       -2.0)
+        self.declare_parameter('spawn_y',       -1.5)
+        self.declare_parameter('spawn_yaw_deg', -90.0)
         self.declare_parameter('camera_alias', '/RoboMasterEP/Camera')
         image_topic = str(self.get_parameter('image_topic').value)
         self.target_frame = str(self.get_parameter('target_frame').value)
         camera_alias = str(self.get_parameter('camera_alias').value)
+        spawn_x   = float(self.get_parameter('spawn_x').value)
+        spawn_y   = float(self.get_parameter('spawn_y').value)
+        spawn_yaw = math.radians(float(self.get_parameter('spawn_yaw_deg').value))
+        # Precompute R(-spawn_yaw) for world→odom coordinate transform.
+        # odom_x = c*dx - s*dy,  odom_y = s*dx + c*dy,  where dx/dy = world - spawn
+        self._spawn_x = spawn_x
+        self._spawn_y = spawn_y
+        self._c_spawn = math.cos(-spawn_yaw)
+        self._s_spawn = math.sin(-spawn_yaw)
 
         # ---- sim handles --------------------------------------------
         # Keep the client as a member: anonymous clients can be
@@ -228,13 +240,17 @@ class ColorDetectorNode(Node):
         if handle is None:
             return
         pos = self.sim.getObjectPosition(handle, -1)
+        dx = float(pos[0]) - self._spawn_x
+        dy = float(pos[1]) - self._spawn_y
+        odom_x = self._c_spawn * dx - self._s_spawn * dy
+        odom_y = self._s_spawn * dx + self._c_spawn * dy
 
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.target_frame
-        msg.pose.position.x = float(pos[0])
-        msg.pose.position.y = float(pos[1])
-        msg.pose.position.z = float(pos[2])
+        msg.pose.position.x = odom_x
+        msg.pose.position.y = odom_y
+        msg.pose.position.z = 0.0
         msg.pose.orientation.w = 1.0
         self._target_pubs[target.name].publish(msg)
         self._published.add(target.name)

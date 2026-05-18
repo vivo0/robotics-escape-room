@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from nav_msgs.msg import OccupancyGrid
 
-MIN_FRONTIER_CELLS = 5
+MIN_FRONTIER_CELLS = 20
 
 
 def compute_frontiers(grid: OccupancyGrid) -> list[tuple[float, float]]:
