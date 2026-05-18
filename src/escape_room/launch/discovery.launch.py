@@ -91,11 +91,6 @@ def generate_launch_description() -> LaunchDescription:
                 executable="color_detector_node",
                 name="color_detector_node",
                 output="screen",
-                parameters=[{
-                    "spawn_x":       -2.0,
-                    "spawn_y":       -1.5,
-                    "spawn_yaw_deg": -90.0,
-                }],
             ),
             # Mission FSM: sends NavigateToPose goals + drives gripper via ZMQ
             Node(

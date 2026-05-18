@@ -8,21 +8,24 @@ Looks for three coloured landmarks in the robot's camera image:
     door  (blue rectangle) → sim alias /Door_0
 
 The largest HSV-matching connected component is the detection. The
-first time a target clears its pixel threshold we publish:
+first time a target clears its pixel threshold we:
 
-* the sim-truth pose on ``/targets/<name>`` — used by ``explorer_node``
-  for navigation;
-* a marker at the *camera-estimated* position on ``/targets/markers``,
-  i.e. the blob centroid back-projected through the pinhole and
-  pushed to the depth implied by the known target size. So the user
-  can see in RViz where the robot *thinks* it saw the target.
+1. Retrieve its world position from CoppeliaSim (sim truth).
+2. Express that position in base_link frame using the robot's current
+   world pose (also from sim).
+3. Transform base_link → map using the live TF tree.
+4. Publish the result as a latched PoseStamped in the map frame.
+
+If the map→odom TF is not yet available when a target is first detected,
+the detection is stored in _pending and retried on every subsequent image
+frame until the transform succeeds.
 
 Subscribes:
     /camera/image_color    (sensor_msgs/Image)
 
 Publishes (latched):
-    /targets/{cube,plate,door}  (geometry_msgs/PoseStamped)
-    /targets/markers            (visualization_msgs/MarkerArray)
+    /targets/{cube,plate,door}  (geometry_msgs/PoseStamped, frame: map)
+    /targets/markers            (visualization_msgs/MarkerArray,  frame: map)
 """
 from __future__ import annotations
 
@@ -32,6 +35,8 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 import rclpy
+import rclpy.time
+import tf2_ros
 from cv_bridge import CvBridge
 from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSProfile,
@@ -51,6 +56,12 @@ def _hsv_range(h_lo: int, h_hi: int,
     """OpenCV HSV (lo, hi) pair. H is in [0, 179]."""
     return (np.array([h_lo, s_lo, v_lo], dtype=np.uint8),
             np.array([h_hi, s_hi, v_hi], dtype=np.uint8))
+
+
+def _yaw_from_quat(q) -> float:
+    """CoppeliaSim quaternion [x, y, z, w] → yaw (rad)."""
+    x, y, z, w = q
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
 @dataclass
@@ -79,30 +90,32 @@ class ColorDetectorNode(Node):
     def __init__(self) -> None:
         super().__init__('color_detector_node')
 
-        self.declare_parameter('image_topic', '/camera/image_color')
-        self.declare_parameter('target_frame', 'odom')
-        self.declare_parameter('spawn_x',       -2.0)
-        self.declare_parameter('spawn_y',       -1.5)
-        self.declare_parameter('spawn_yaw_deg', -90.0)
+        self.declare_parameter('image_topic',  '/camera/image_color')
+        self.declare_parameter('robot_alias',  '/RoboMasterEP/BaseLinkFrame')
         self.declare_parameter('camera_alias', '/RoboMasterEP/Camera')
-        image_topic = str(self.get_parameter('image_topic').value)
-        self.target_frame = str(self.get_parameter('target_frame').value)
+        self.declare_parameter('map_frame',    'map')
+        image_topic  = str(self.get_parameter('image_topic').value)
+        robot_alias  = str(self.get_parameter('robot_alias').value)
         camera_alias = str(self.get_parameter('camera_alias').value)
-        spawn_x   = float(self.get_parameter('spawn_x').value)
-        spawn_y   = float(self.get_parameter('spawn_y').value)
-        spawn_yaw = math.radians(float(self.get_parameter('spawn_yaw_deg').value))
-        # Precompute R(-spawn_yaw) for world→odom coordinate transform.
-        # odom_x = c*dx - s*dy,  odom_y = s*dx + c*dy,  where dx/dy = world - spawn
-        self._spawn_x = spawn_x
-        self._spawn_y = spawn_y
-        self._c_spawn = math.cos(-spawn_yaw)
-        self._s_spawn = math.sin(-spawn_yaw)
+        self._map_frame = str(self.get_parameter('map_frame').value)
+
+        # ---- TF ------------------------------------------------------
+        self._tf_buffer   = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
         # ---- sim handles --------------------------------------------
         # Keep the client as a member: anonymous clients can be
         # garbage-collected, dropping the ZMQ connection.
         self.client = RemoteAPIClient()
         self.sim = self.client.require('sim')
+
+        try:
+            self._robot_handle: int | None = self.sim.getObject(robot_alias)
+        except Exception:
+            self.get_logger().warn(
+                f"could not resolve robot '{robot_alias}'; "
+                f"target localisation will fail")
+            self._robot_handle = None
 
         self._handles: dict[str, int | None] = {}
         for t in _TARGETS:
@@ -132,6 +145,7 @@ class ColorDetectorNode(Node):
             MarkerArray, '/targets/markers', latched)
         self._published: set[str] = set()
         self._marker_poses: dict[str, tuple[float, float, float]] = {}
+        self._pending: dict[str, tuple[ColorTarget, tuple]] = {}
 
         self._bridge = CvBridge()
         self.create_subscription(Image, image_topic, self._on_image, 10)
@@ -194,7 +208,7 @@ class ColorDetectorNode(Node):
     # ===== callbacks ====================================================
 
     def _on_image(self, msg: Image) -> None:
-        if len(self._published) == len(_TARGETS):
+        if len(self._published) == len(_TARGETS) and not self._pending:
             return
         try:
             bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -204,12 +218,20 @@ class ColorDetectorNode(Node):
             return
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
 
+        # Retry pending detections (TF may now be available).
+        for name in list(self._pending):
+            t, det = self._pending[name]
+            if self._try_publish(t, det):
+                del self._pending[name]
+
+        # Detect and publish new targets.
         for t in _TARGETS:
-            if t.name in self._published:
+            if t.name in self._published or t.name in self._pending:
                 continue
             det = self._detect(hsv, t)
             if det is not None:
-                self._publish_target(t, det)
+                if not self._try_publish(t, det):
+                    self._pending[t.name] = (t, det)
 
     # ===== detection / publishing =======================================
 
@@ -234,41 +256,63 @@ class ColorDetectorNode(Node):
                       int(stats[idx, cv2.CC_STAT_HEIGHT]))
         return cx, cy, size_px
 
-    def _publish_target(self, target: ColorTarget,
-                        detection: tuple[float, float, int]) -> None:
+    def _try_publish(self, target: ColorTarget,
+                     detection: tuple[float, float, int]) -> bool:
+        """Localise target in map frame and publish. Returns False if TF
+        is not yet available (caller should retry)."""
+        if self._robot_handle is None:
+            return False
         handle = self._handles.get(target.name)
         if handle is None:
-            return
-        pos = self.sim.getObjectPosition(handle, -1)
-        dx = float(pos[0]) - self._spawn_x
-        dy = float(pos[1]) - self._spawn_y
-        odom_x = self._c_spawn * dx - self._s_spawn * dy
-        odom_y = self._s_spawn * dx + self._c_spawn * dy
+            return True  # no sim object → skip permanently
 
+        # --- sim truth → base_link frame --------------------------------
+        pos_w = self.sim.getObjectPosition(handle, -1)
+        r_pos = self.sim.getObjectPosition(self._robot_handle, -1)
+        r_q   = self.sim.getObjectQuaternion(self._robot_handle, -1)
+        r_yaw = _yaw_from_quat(r_q)
+        dx, dy = pos_w[0] - r_pos[0], pos_w[1] - r_pos[1]
+        c, s   = math.cos(-r_yaw), math.sin(-r_yaw)
+        bl_x, bl_y = c * dx - s * dy, s * dx + c * dy
+
+        # --- base_link → map via TF -------------------------------------
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                self._map_frame, 'base_link', rclpy.time.Time())
+            qz, qw_r = tf.transform.rotation.z, tf.transform.rotation.w
+            yaw = 2.0 * math.atan2(qz, qw_r)
+            c2, s2 = math.cos(yaw), math.sin(yaw)
+            map_x = c2 * bl_x - s2 * bl_y + tf.transform.translation.x
+            map_y = s2 * bl_x + c2 * bl_y + tf.transform.translation.y
+        except Exception:
+            return False  # TF not ready; caller stores in _pending
+
+        # --- publish pose -----------------------------------------------
         msg = PoseStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = self.target_frame
-        msg.pose.position.x = odom_x
-        msg.pose.position.y = odom_y
-        msg.pose.position.z = 0.0
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = self._map_frame
+        msg.pose.position.x = map_x
+        msg.pose.position.y = map_y
         msg.pose.orientation.w = 1.0
         self._target_pubs[target.name].publish(msg)
         self._published.add(target.name)
 
-        cam = self._estimate_world_xyz(target, *detection)
-        marker_xyz = cam if cam is not None else (
-            float(pos[0]), float(pos[1]), float(pos[2]))
-        self._marker_poses[target.name] = marker_xyz
+        # --- markers + log ----------------------------------------------
+        self._marker_poses[target.name] = (map_x, map_y, float(pos_w[2]))
         self._publish_markers()
 
+        cam = self._estimate_world_xyz(target, *detection)
         if cam is not None:
-            err = math.hypot(cam[0] - pos[0], cam[1] - pos[1])
+            err = math.hypot(cam[0] - pos_w[0], cam[1] - pos_w[1])
             self.get_logger().info(
-                f'[{target.name}] sim ({pos[0]:.2f}, {pos[1]:.2f}) → '
-                f'cam ({cam[0]:.2f}, {cam[1]:.2f}); err={err:.2f} m')
+                f'[{target.name}] map ({map_x:.2f}, {map_y:.2f}) '
+                f'sim ({pos_w[0]:.2f}, {pos_w[1]:.2f}) '
+                f'cam-err={err:.2f} m')
         else:
             self.get_logger().info(
-                f'[{target.name}] @ ({pos[0]:.2f}, {pos[1]:.2f})')
+                f'[{target.name}] map ({map_x:.2f}, {map_y:.2f}) '
+                f'sim ({pos_w[0]:.2f}, {pos_w[1]:.2f})')
+        return True
 
     def _estimate_world_xyz(self, target: ColorTarget,
                             cx: float, cy: float, size_px: int
@@ -312,7 +356,7 @@ class ColorDetectorNode(Node):
     def _sphere_marker(self, t: ColorTarget,
                        xyz: tuple[float, float, float], stamp) -> Marker:
         m = Marker()
-        m.header.frame_id = self.target_frame
+        m.header.frame_id = self._map_frame
         m.header.stamp = stamp
         m.ns = 'targets'
         m.id = hash(t.name) & 0xFFFF
@@ -328,7 +372,7 @@ class ColorDetectorNode(Node):
     def _label_marker(self, t: ColorTarget,
                       xyz: tuple[float, float, float], stamp) -> Marker:
         m = Marker()
-        m.header.frame_id = self.target_frame
+        m.header.frame_id = self._map_frame
         m.header.stamp = stamp
         m.ns = 'target_labels'
         m.id = hash(t.name) & 0xFFFF
