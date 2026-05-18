@@ -1,26 +1,7 @@
 #!/usr/bin/env python3
 """Mission FSM for the escape room.
 
-This module owns only the FSM dispatcher (`_tick` + `_handlers`), the
-state transitions (`enter`), the navigation-tick fallthrough
-(`_tick_navigate`), and the ROS callbacks. Everything else lives in
-``escape_room.nodes.explorer.*``:
-
-    params.py        parameter declaration + loading
-    sim_setup.py     CoppeliaSim ZMQ resolution + engage-dist auto-detect
-    pose.py          TF pose lookup
-    door.py          door-threshold approach geometry
-    explore.py       frontier-goal selection
-    gripper_phase.py pickup_open / pickup_close / drop_open dispatcher
-    pickup.py        pickup_align tick
-    drop.py          drop_align + drop_backup ticks
-    exit_drive.py    exit_drive tick
-    frontier.py      occupancy-grid frontier extraction
-    gripper_io.py    ZMQ gripper / cube-detectability wrapper
-    nav_client.py    Nav2 NavigateToPose action client wrapper
-
 State sequence:
-
     explore
       → go_to_key
       → pickup_open → pickup_align → pickup_close
@@ -39,19 +20,21 @@ import tf2_ros
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid
 from nav_msgs.msg import Path as PathMsg
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+from rclpy.time import Time
 
-from .explorer.door import door_threshold_xy_yaw
-from .explorer.drop import tick_drop_align, tick_drop_backup
-from .explorer.exit_drive import tick_exit_drive
-from .explorer.explore import send_frontier_goal
-from .explorer.gripper_phase import tick_gripper_wait
+from .explorer.frontier import send_frontier_goal
 from .explorer.nav_client import NavClient
-from .explorer.params import declare_explorer_params
-from .explorer.pickup import tick_pickup_align
-from .explorer.pose import lookup_pose
-from .explorer.sim_setup import setup_sim
+from .explorer.phases import (
+    tick_drop_align,
+    tick_drop_backup,
+    tick_exit_drive,
+    tick_gripper_wait,
+    tick_pickup_align,
+)
+from .explorer.sim import setup_sim
 
 
 class ExplorerNode(Node):
@@ -59,7 +42,7 @@ class ExplorerNode(Node):
 
     def __init__(self) -> None:
         super().__init__("explorer_node")
-        declare_explorer_params(self)
+        self._declare_params()
         self.gripper = setup_sim(self)
 
         self._tf_buffer = tf2_ros.Buffer()
@@ -106,6 +89,51 @@ class ExplorerNode(Node):
         self.create_timer(1.0 / self.control_rate_hz, self._tick)
         self.get_logger().info("ready; waiting for Nav2 and slam_toolbox...")
 
+    def _declare_params(self) -> None:
+        p = self.declare_parameter
+        p("robot_alias", "/RoboMasterEP/BaseLinkFrame")
+        p("cube_alias", "/TargetCube")
+        p("map_frame", "map")
+        p("base_frame", "base_link")
+        p("control_rate_hz", 4.0)
+        p("door_threshold_inset_m", 0.20)
+        p("exit_drive_speed_mps", 0.10)
+        p("exit_drive_duration_s", 5.0)
+        p("pickup_standoff_m", 0.50)
+        p("pickup_engage_dist_tol_m", 0.03)
+        p("drop_backup_speed_mps", 0.05)
+        p("drop_backup_duration_s", 8.0)
+        p("plate_drop_distance_m", 0.30)
+        p("plate_drop_dist_tol_m", 0.04)
+        p("park_max_speed_mps", 0.06)
+        p("align_yaw_tol_rad", 0.08)
+        p("align_kp", 1.5)
+        p("align_max_omega", 0.6)
+        p("gripper_timeout_s", 4.0)
+
+        def g(n):
+            return self.get_parameter(n).value
+
+        self.robot_alias = g("robot_alias")
+        self.cube_alias = g("cube_alias")
+        self.map_frame = g("map_frame")
+        self.base_frame = g("base_frame")
+        self.control_rate_hz = float(g("control_rate_hz"))
+        self.door_threshold_inset = float(g("door_threshold_inset_m"))
+        self.exit_drive_speed = float(g("exit_drive_speed_mps"))
+        self.exit_drive_duration = float(g("exit_drive_duration_s"))
+        self.pickup_standoff = float(g("pickup_standoff_m"))
+        self.pickup_engage_dist_tol = float(g("pickup_engage_dist_tol_m"))
+        self.backup_speed = float(g("drop_backup_speed_mps"))
+        self.backup_duration = float(g("drop_backup_duration_s"))
+        self.drop_distance = float(g("plate_drop_distance_m"))
+        self.drop_dist_tol = float(g("plate_drop_dist_tol_m"))
+        self.park_max_speed = float(g("park_max_speed_mps"))
+        self.align_yaw_tol = float(g("align_yaw_tol_rad"))
+        self.align_kp = float(g("align_kp"))
+        self.align_max_omega = float(g("align_max_omega"))
+        self.gripper_timeout = float(g("gripper_timeout_s"))
+
     # ===== ROS callbacks =============================================
 
     def _on_map(self, msg: OccupancyGrid) -> None:
@@ -138,7 +166,6 @@ class ExplorerNode(Node):
         )
 
     def _tick_navigate(self) -> None:
-        """Runs while a Nav2 goal is in flight or has just returned."""
         if self.nav.active:
             return
         if self.mode == "explore":
@@ -177,9 +204,11 @@ class ExplorerNode(Node):
             self.publish_nav_goal_path(px, py)
             self.nav.send(px, py)
         elif mode == "go_to_door":
-            tx, ty, yaw = door_threshold_xy_yaw(
-                self.targets["door"], self.door_normal, self.door_threshold_inset
-            )
+            dx, dy = self.targets["door"]
+            nx, ny = self.door_normal
+            tx = dx - self.door_threshold_inset * nx
+            ty = dy - self.door_threshold_inset * ny
+            yaw = math.atan2(ny, nx)
             self.get_logger().info(
                 f"door threshold=({tx:.2f}, {ty:.2f}, yaw={math.degrees(yaw):+.0f}°)"
             )
@@ -192,7 +221,19 @@ class ExplorerNode(Node):
         self.cmd_pub.publish(Twist())
 
     def get_robot_pose(self) -> tuple[float, float, float] | None:
-        return lookup_pose(self._tf_buffer, self.map_frame, self.base_frame)
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                self.map_frame, self.base_frame, Time(), timeout=Duration(seconds=0.1)
+            )
+        except Exception:
+            return None
+        x = tf.transform.translation.x
+        y = tf.transform.translation.y
+        q = tf.transform.rotation
+        yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y**2 + q.z**2)
+        )
+        return float(x), float(y), float(yaw)
 
     def clock_s(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9

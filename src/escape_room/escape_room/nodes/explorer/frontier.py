@@ -1,6 +1,8 @@
-"""Frontier-cluster extraction from an OccupancyGrid."""
+"""Frontier extraction from OccupancyGrid and nearest-frontier goal dispatch."""
 
 from __future__ import annotations
+
+import math
 
 from nav_msgs.msg import OccupancyGrid
 
@@ -55,3 +57,19 @@ def compute_frontiers(grid: OccupancyGrid) -> list[tuple[float, float]]:
             cc = sum(c for _, c in cluster) / len(cluster)
             centroids.append((ox + (cc + 0.5) * res, oy + (cr + 0.5) * res))
     return centroids
+
+
+def send_frontier_goal(node) -> None:
+    frontiers = compute_frontiers(node.current_map)
+    if not frontiers:
+        node.get_logger().info(
+            "no frontiers; map fully explored", throttle_duration_sec=5.0
+        )
+        return
+    pose = node.get_robot_pose()
+    if pose is None:
+        return
+    rx, ry, _ = pose
+    fx, fy = min(frontiers, key=lambda f: math.hypot(f[0] - rx, f[1] - ry))
+    node.publish_nav_goal_path(fx, fy)
+    node.nav.send(fx, fy)
