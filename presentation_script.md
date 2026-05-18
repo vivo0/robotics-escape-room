@@ -18,11 +18,9 @@ Our initial work covered: building the scene builder, wiring up the ROS 2 / Nav2
 
 In terms of preliminary results: exploration and mapping work reliably. The robot builds a clean occupancy map, Nav2 plans paths around obstacles, and the door controller correctly opens the door when the cube lands on the plate.
 
-The first major challenge was the lidar sensor. CoppeliaSim doesn't give you a lidar out of the box, so we implemented one in Lua — a script injected into the robot at scene build time that casts 360 rays and publishes a `LaserScan` on `/scan`.
+We started with a Velodyne, but because it was too complex (3d point cloud, hard to integrate) we then replaced it with a custom Lua sensor that casts 360 rays and publishes `/scan`. That required compiling the CoppeliaSim ROS 2 plugin from source, since it's not bundled by default.
 
-The problem was coordinate frames. CoppeliaSim's `BaseLinkFrame` uses −Y as physical forward, while ROS expects +X. Our rays were cast in world-frame directions but labeled as laser-frame angles, so slam_toolbox re-rotated them by the robot's yaw — producing a map rotated 90 degrees. Every Nav2 goal fell outside the costmap. We fixed it by adding the robot yaw to each ray angle before casting, and explicitly aligning the sensor dummy's orientation to `BaseLinkFrame`.
-
-A second related issue: the lidar sensor rays were hitting the coloured objects and our colour detector was incorrectly triggering on those hits, thinking they were detections. We had to make the robot body non-detectable by the proximity sensor so rays pass through the chassis and only hit real obstacles.
+The open challenge is detection. The lidar covers 360° so mapping is fine, but the camera only looks forward — the robot can finish exploring without ever seeing the targets. For now we use simulator ground-truth positions directly, but the goal is to make it work with real camera detection.
 
 ---
 
