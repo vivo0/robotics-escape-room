@@ -26,8 +26,8 @@ from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.time import Time
 
 from .explorer.frontier import compute_frontiers
+from .explorer.gripper import GripperIO
 from .explorer.nav_client import NavClient
-from .explorer.sim import GRIPPER_CLOSE, GRIPPER_OPEN, GripperIO, setup_sim
 from .explorer.state import State
 
 
@@ -45,7 +45,7 @@ class ExplorerNode(Node):
     def __init__(self) -> None:
         super().__init__("explorer_node")
         self._declare_params()
-        self.gripper: GripperIO = setup_sim(self)
+        self.gripper = GripperIO(self.robot_alias, self.cube_alias, self.get_logger())
 
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
@@ -236,21 +236,20 @@ class ExplorerNode(Node):
     def _tick_gripper_wait(self) -> None:
         self.stop()
         elapsed = self.clock_s() - self.action_t
-        logger = self.get_logger()
-        if self.mode == State.PICKUP_OPEN and self.gripper.reached(
-            GRIPPER_OPEN, elapsed, self.gripper_timeout, logger
+        if self.mode == State.PICKUP_OPEN and self.gripper.is_open(
+            elapsed, self.gripper_timeout
         ):
             self._transition(State.PICKUP_ALIGN)
-        elif self.mode == State.PICKUP_CLOSE and self.gripper.reached(
-            GRIPPER_CLOSE, elapsed, self.gripper_timeout, logger
+        elif self.mode == State.PICKUP_CLOSE and self.gripper.is_closed(
+            elapsed, self.gripper_timeout
         ):
-            self.gripper.hide_cube_from_lidar()
+            self.gripper.set_cube_visible(False)
             self._transition(State.GO_TO_PLATE)
             self._nav_go_to_plate()
-        elif self.mode == State.DROP_OPEN and self.gripper.reached(
-            GRIPPER_OPEN, elapsed, self.gripper_timeout, logger
+        elif self.mode == State.DROP_OPEN and self.gripper.is_open(
+            elapsed, self.gripper_timeout
         ):
-            self.gripper.show_cube_to_lidar()
+            self.gripper.set_cube_visible(True)
             self._transition(State.DROP_BACKUP)
             self.action_t = self.clock_s()
 
@@ -259,7 +258,7 @@ class ExplorerNode(Node):
     def _tick_pickup_align(self) -> None:
         """P-controller: face cube, approach to pickup_engage_dist, then close."""
         if self._tick_align(
-            self.targets["cube"], self.pickup_engage_dist,
+            self.targets["cube"], self.gripper.pickup_engage_dist,
             self.pickup_engage_dist_tol, State.PICKUP_CLOSE,
         ):
             self.action_t = self.clock_s()
@@ -369,7 +368,7 @@ class ExplorerNode(Node):
 
     def _nav_go_to_door(self) -> None:
         dx, dy = self.targets["door"]
-        nx, ny = self.door_normal
+        nx, ny = self.gripper.door_normal
         tx = dx - self.door_threshold_inset * nx
         ty = dy - self.door_threshold_inset * ny
         yaw = math.atan2(ny, nx)
