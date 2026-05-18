@@ -51,7 +51,7 @@ Tests are style-only (`ament_flake8`, `ament_pep257`, `ament_copyright`). There 
 
 The project uses a Nav2 + slam_toolbox navigation stack:
 
-**Discovery**: `lidar_node` casts ground-truth rays against CoppeliaSim scene geometry and publishes `sensor_msgs/LaserScan` on `/scan`. `slam_toolbox` builds a 2D occupancy map from these scans and provides `map→odom` localisation. `color_detector_node` finds coloured landmarks via HSV masking on the camera image.
+**Discovery**: A Lua script (`lidar_sensor.lua`) injected into the robot casts ground-truth rays and publishes `sensor_msgs/LaserScan` on `/scan`. `robomaster_ros` publishes wheel-encoder odometry on `/odom` and the `odom→base_link` TF. `slam_toolbox` builds a 2D occupancy map and provides `map→odom` localisation. `color_detector_node` finds coloured landmarks via HSV masking on the camera image, transforms each detection to the map frame via TF, and publishes latched `PoseStamped` on `/targets/{cube,plate,door}`.
 
 **Execution**: `explorer_node` sends `NavigateToPose` action goals to Nav2 for all navigation (exploration waypoints, go-to-key, go-to-plate, go-to-door). Short-range gripper manoeuvres (cube pickup alignment, plate drop alignment) still use direct `cmd_vel`. Gripper and cube attach/detach are driven via CoppeliaSim ZMQ.
 
@@ -59,8 +59,8 @@ The project uses a Nav2 + slam_toolbox navigation stack:
 
 | Node | Role |
 |---|---|
-| `lidar_node` | ZMQ ray-caster → `/scan` (LaserScan, 10 Hz) + static `base_link→laser` TF |
-| `color_detector_node` | Camera → HSV → blob → `PoseStamped` on `/targets/{cube,plate,door}` |
+| `lidar_sensor.lua` | Lua script injected into robot: ZMQ ray-caster → `/scan` (LaserScan, 10 Hz) |
+| `color_detector_node` | Camera → HSV → blob → sim-truth → TF → `PoseStamped` (map frame) on `/targets/{cube,plate,door}` |
 | `explorer_node` | Mission FSM: sends Nav2 `NavigateToPose` goals + gripper control via ZMQ |
 | `door_controller` | Polls CoppeliaSim via ZMQ, opens door when cube is on pressure plate |
 
@@ -80,7 +80,7 @@ Scenarios live in `src/escape_room/scenarios/`. Each file fully describes the ro
 - `obstacles` — list of `box`/`cylinder` primitives
 - `target_cube`, `pressure_plate`, `door` — landmark positions, sizes, and RGB colours
 
-Object colours must match the HSV ranges in `color_detector_node.py` (cube: magenta ~280–340°; plate: green 80–160°; door: blue 200–260°). The key avoids red (previously Velodyne beams rendered red; now no Velodyne in the scene) and yellow (the CoppeliaSim default floor pattern is yellow); magenta is the safe distinct hue.
+Object colours must match the HSV ranges in `color_detector_node.py` (cube: magenta ~280–340°; plate: green 80–160°; door: blue 200–260°). Cube avoids red (floor/wall artefacts) and yellow (CoppeliaSim default floor pattern); magenta is the safe distinct hue.
 
 ### Key source locations
 

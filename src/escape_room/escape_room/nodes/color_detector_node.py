@@ -74,7 +74,7 @@ class ColorTarget:
     hsv_ranges: list = field(default_factory=list)
 
 
-# Cube is magenta (not red, which the Velodyne beams paint; not yellow,
+# Cube is magenta (not red, which causes artefacts; not yellow,
 # which the default floor pattern uses).
 _TARGETS: tuple[ColorTarget, ...] = (
     ColorTarget('cube',  '/TargetCube',     80, (0.9, 0.1, 0.9), 0.12,
@@ -94,13 +94,13 @@ class ColorDetectorNode(Node):
         self.declare_parameter('robot_alias',  '/RoboMasterEP/BaseLinkFrame')
         self.declare_parameter('camera_alias', '/RoboMasterEP/Camera')
         self.declare_parameter('map_frame',    'map')
-        image_topic  = str(self.get_parameter('image_topic').value)
-        robot_alias  = str(self.get_parameter('robot_alias').value)
+        image_topic = str(self.get_parameter('image_topic').value)
+        robot_alias = str(self.get_parameter('robot_alias').value)
         camera_alias = str(self.get_parameter('camera_alias').value)
         self._map_frame = str(self.get_parameter('map_frame').value)
 
         # ---- TF ------------------------------------------------------
-        self._tf_buffer   = tf2_ros.Buffer()
+        self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
         # ---- sim handles --------------------------------------------
@@ -269,10 +269,10 @@ class ColorDetectorNode(Node):
         # --- sim truth → base_link frame --------------------------------
         pos_w = self.sim.getObjectPosition(handle, -1)
         r_pos = self.sim.getObjectPosition(self._robot_handle, -1)
-        r_q   = self.sim.getObjectQuaternion(self._robot_handle, -1)
+        r_q = self.sim.getObjectQuaternion(self._robot_handle, -1)
         r_yaw = _yaw_from_quat(r_q)
         dx, dy = pos_w[0] - r_pos[0], pos_w[1] - r_pos[1]
-        c, s   = math.cos(-r_yaw), math.sin(-r_yaw)
+        c, s = math.cos(-r_yaw), math.sin(-r_yaw)
         bl_x, bl_y = c * dx - s * dy, s * dx + c * dy
 
         # --- base_link → map via TF -------------------------------------
@@ -289,7 +289,7 @@ class ColorDetectorNode(Node):
 
         # --- publish pose -----------------------------------------------
         msg = PoseStamped()
-        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self._map_frame
         msg.pose.position.x = map_x
         msg.pose.position.y = map_y

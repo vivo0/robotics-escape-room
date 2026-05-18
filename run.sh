@@ -136,6 +136,6 @@ echo "[run] Launching door_controller in background..."
 ros2 run escape_room door_controller >/tmp/door_controller.log 2>&1 &
 
 # 8. Discovery launch in the foreground (mapper + static TF)
-echo "[run] Launching discovery (mapper + velodyne TF). Ctrl-C to stop..."
+echo "[run] Launching discovery (SLAM + Nav2 + mission). Ctrl-C to stop..."
 trap 'kill_all' EXIT INT TERM
 ros2 launch escape_room discovery.launch.py
