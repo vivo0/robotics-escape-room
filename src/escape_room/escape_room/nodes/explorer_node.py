@@ -74,18 +74,18 @@ class ExplorerNode(Node):
         self._started: bool = False
 
         self._handlers = {
-            State.EXPLORE: self._tick_explore,
-            State.GO_TO_KEY: self._tick_go_to_key,
-            State.GO_TO_PLATE: self._tick_go_to_plate,
-            State.GO_TO_DOOR: self._tick_go_to_door,
-            State.PICKUP_OPEN: self._tick_gripper_wait,
-            State.PICKUP_ALIGN: self._tick_pickup_align,
-            State.PICKUP_CLOSE: self._tick_gripper_wait,
-            State.DROP_OPEN: self._tick_gripper_wait,
-            State.DROP_ALIGN: self._tick_drop_align,
-            State.DROP_BACKUP: self._tick_drop_backup,
-            State.EXIT_DRIVE: self._tick_exit_drive,
-            State.DONE: self._tick_done,
+            State.EXPLORE: self._explore,
+            State.GO_TO_KEY: self._go_to_key,
+            State.GO_TO_PLATE: self._go_to_plate,
+            State.GO_TO_DOOR: self._go_to_door,
+            State.PICKUP_OPEN: self._pickup_open,
+            State.PICKUP_ALIGN: self._pickup_align,
+            State.PICKUP_CLOSE: self._pickup_close,
+            State.DROP_OPEN: self._drop_open,
+            State.DROP_ALIGN: self._drop_align,
+            State.DROP_BACKUP: self._drop_backup,
+            State.EXIT_DRIVE: self._exit_drive,
+            State.DONE: self._done,
         }
 
         self.create_timer(1.0 / self.control_rate_hz, self._tick)
@@ -175,7 +175,7 @@ class ExplorerNode(Node):
 
     # ===== nav-phase tick methods =====================================
 
-    def _tick_explore(self) -> None:
+    def _explore(self) -> None:
         if len(self.targets) == 3:
             self._transition(State.GO_TO_KEY)
             self._nav_go_to_key()
@@ -196,7 +196,7 @@ class ExplorerNode(Node):
         self.publish_nav_goal_path(fx, fy)
         self.nav.send(fx, fy)
 
-    def _tick_go_to_key(self) -> None:
+    def _go_to_key(self) -> None:
         if self.nav.active:
             return
         if not self.nav.succeeded:
@@ -208,7 +208,7 @@ class ExplorerNode(Node):
         self.action_t = self.clock_s()
         self.gripper.open()
 
-    def _tick_go_to_plate(self) -> None:
+    def _go_to_plate(self) -> None:
         if self.nav.active:
             return
         if not self.nav.succeeded:
@@ -218,7 +218,7 @@ class ExplorerNode(Node):
         self.stop()
         self._transition(State.DROP_ALIGN)
 
-    def _tick_go_to_door(self) -> None:
+    def _go_to_door(self) -> None:
         if self.nav.active:
             return
         if not self.nav.succeeded:
@@ -228,52 +228,54 @@ class ExplorerNode(Node):
         self._transition(State.EXIT_DRIVE)
         self.action_t = self.clock_s()
 
-    def _tick_done(self) -> None:
+    def _done(self) -> None:
         pass
 
-    # ===== gripper-wait tick (pickup_open, pickup_close, drop_open) ===
+    # ===== gripper-wait tick methods ==================================
 
-    def _tick_gripper_wait(self) -> None:
+    def _pickup_open(self) -> None:
         self.stop()
         elapsed = self.clock_s() - self.action_t
-        if self.mode == State.PICKUP_OPEN and self.gripper.is_open(
-            elapsed, self.gripper_timeout
-        ):
+        if self.gripper.is_open(elapsed, self.gripper_timeout):
             self._transition(State.PICKUP_ALIGN)
-        elif self.mode == State.PICKUP_CLOSE and self.gripper.is_closed(
-            elapsed, self.gripper_timeout
-        ):
+
+    def _pickup_close(self) -> None:
+        self.stop()
+        elapsed = self.clock_s() - self.action_t
+        if self.gripper.is_closed(elapsed, self.gripper_timeout):
             self.gripper.set_cube_visible(False)
             self._transition(State.GO_TO_PLATE)
             self._nav_go_to_plate()
-        elif self.mode == State.DROP_OPEN and self.gripper.is_open(
-            elapsed, self.gripper_timeout
-        ):
+
+    def _drop_open(self) -> None:
+        self.stop()
+        elapsed = self.clock_s() - self.action_t
+        if self.gripper.is_open(elapsed, self.gripper_timeout):
             self.gripper.set_cube_visible(True)
             self._transition(State.DROP_BACKUP)
             self.action_t = self.clock_s()
 
     # ===== align-phase tick methods ===================================
 
-    def _tick_pickup_align(self) -> None:
+    def _pickup_align(self) -> None:
         """P-controller: face cube, approach to pickup_engage_dist, then close."""
-        if self._tick_align(
+        if self._align(
             self.targets["cube"], self.gripper.pickup_engage_dist,
             self.pickup_engage_dist_tol, State.PICKUP_CLOSE,
         ):
             self.action_t = self.clock_s()
             self.gripper.close()
 
-    def _tick_drop_align(self) -> None:
+    def _drop_align(self) -> None:
         """P-controller: face plate, approach to drop_distance, then open gripper."""
-        if self._tick_align(
+        if self._align(
             self.targets["plate"], self.drop_distance,
             self.drop_dist_tol, State.DROP_OPEN,
         ):
             self.action_t = self.clock_s()
             self.gripper.open()
 
-    def _tick_align(
+    def _align(
         self,
         target_xy: tuple[float, float],
         engage_dist: float,
@@ -314,7 +316,7 @@ class ExplorerNode(Node):
 
     # ===== timed-drive tick methods ===================================
 
-    def _tick_drop_backup(self) -> None:
+    def _drop_backup(self) -> None:
         if self.clock_s() - self.action_t >= self.backup_duration:
             self.stop()
             self._transition(State.GO_TO_DOOR)
@@ -324,7 +326,7 @@ class ExplorerNode(Node):
         twist.linear.x = -self.backup_speed
         self.cmd_pub.publish(twist)
 
-    def _tick_exit_drive(self) -> None:
+    def _exit_drive(self) -> None:
         if self.clock_s() - self.action_t >= self.exit_drive_duration:
             self.stop()
             self._transition(State.DONE)
