@@ -193,8 +193,9 @@ class ExplorerNode(Node):
             return
         rx, ry, _ = pose
         fx, fy = min(frontiers, key=lambda f: math.hypot(f[0] - rx, f[1] - ry))
-        self.publish_nav_goal_path(fx, fy)
-        self.nav.send(fx, fy)
+        yaw = math.atan2(fy - ry, fx - rx)
+        self.publish_nav_goal(fx, fy, yaw)
+        self.nav.send(fx, fy, yaw)
 
     def _go_to_key(self) -> None:
         if self.nav.active:

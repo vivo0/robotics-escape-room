@@ -33,7 +33,7 @@ class NavClient:
     def server_ready(self) -> bool:
         return self._client.wait_for_server(timeout_sec=0.0)
 
-    def send(self, x: float, y: float, yaw: float = 0.0) -> bool:
+    def send(self, x: float, y: float, yaw: float) -> bool:
         if not self._client.wait_for_server(timeout_sec=0.0):
             self._node.get_logger().warn("Nav2 action server not available yet")
             return False
