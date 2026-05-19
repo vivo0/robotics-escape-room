@@ -19,7 +19,6 @@ import rclpy
 import tf2_ros
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid
-from nav_msgs.msg import Path as PathMsg
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
@@ -57,7 +56,7 @@ class ExplorerNode(Node):
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
-        self.path_pub = self.create_publisher(PathMsg, "/exploration/path", 10)
+        self.goal_pub = self.create_publisher(PoseStamped, "/exploration/goal", 10)
         for name in ("cube", "plate", "door"):
             self.create_subscription(
                 PoseStamped,
@@ -354,8 +353,8 @@ class ExplorerNode(Node):
         yaw = math.atan2(cy - ry, cx - rx)
         sx = cx - self.pickup_standoff * math.cos(yaw)
         sy = cy - self.pickup_standoff * math.sin(yaw)
-        self.publish_nav_goal_path(sx, sy)
-        self.nav.send(sx, sy, yaw=yaw)
+        self.publish_nav_goal(sx, sy, yaw)
+        self.nav.send(sx, sy, yaw)
 
     def _nav_go_to_plate(self) -> None:
         px, py = self.targets["plate"]
@@ -366,8 +365,8 @@ class ExplorerNode(Node):
         else:
             yaw = 0.0
             self.get_logger().warn("go_to_plate: TF unavailable, yaw=0.0")
-        self.publish_nav_goal_path(px, py)
-        self.nav.send(px, py, yaw=yaw)
+        self.publish_nav_goal(px, py, yaw)
+        self.nav.send(px, py, yaw)
 
     def _nav_go_to_door(self) -> None:
         dx, dy = self.targets["door"]
@@ -378,8 +377,8 @@ class ExplorerNode(Node):
         self.get_logger().info(
             f"door threshold=({tx:.2f}, {ty:.2f}, yaw={math.degrees(yaw):+.0f}°)"
         )
-        self.publish_nav_goal_path(tx, ty)
-        self.nav.send(tx, ty, yaw=yaw)
+        self.publish_nav_goal(tx, ty, yaw)
+        self.nav.send(tx, ty, yaw)
 
     # ===== shared helpers ============================================
 
@@ -404,17 +403,15 @@ class ExplorerNode(Node):
     def clock_s(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
-    def publish_nav_goal_path(self, x: float, y: float) -> None:
-        msg = PathMsg()
+    def publish_nav_goal(self, x: float, y: float, yaw: float) -> None:
+        msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.map_frame
-        ps = PoseStamped()
-        ps.header = msg.header
-        ps.pose.position.x = x
-        ps.pose.position.y = y
-        ps.pose.orientation.w = 1.0
-        msg.poses = [ps]
-        self.path_pub.publish(msg)
+        msg.pose.position.x = x
+        msg.pose.position.y = y
+        msg.pose.orientation.w = math.cos(yaw / 2.0)
+        msg.pose.orientation.z = math.sin(yaw / 2.0)
+        self.goal_pub.publish(msg)
 
 
 def main(args=None) -> None:
