@@ -36,26 +36,7 @@ class GripperIO:
             sim.getObjectPosition(attach_h, base_h)[0]
         )
 
-        door_h = sim.getObject("/Door_0")
-        bbox_dx = sim.getObjectFloatParam(
-            door_h, sim.objfloatparam_objbbox_max_x
-        ) - sim.getObjectFloatParam(door_h, sim.objfloatparam_objbbox_min_x)
-        bbox_dy = sim.getObjectFloatParam(
-            door_h, sim.objfloatparam_objbbox_max_y
-        ) - sim.getObjectFloatParam(door_h, sim.objfloatparam_objbbox_min_y)
-        door_pos = sim.getObjectPosition(door_h, -1)
-        # Thinnest XY axis = wall-normal direction; sign from which side of origin.
-        if bbox_dx < bbox_dy:
-            self.door_normal: tuple[float, float] = (
-                1.0 if door_pos[0] > 0 else -1.0, 0.0
-            )
-        else:
-            self.door_normal = (0.0, 1.0 if door_pos[1] > 0 else -1.0)
-
-        logger.info(
-            f"pickup_engage_dist = {self.pickup_engage_dist:.3f} m; "
-            f"door_normal = ({self.door_normal[0]:+.0f}, {self.door_normal[1]:+.0f})"
-        )
+        logger.info(f"pickup_engage_dist = {self.pickup_engage_dist:.3f} m")
 
     def open(self) -> None:
         self._sim.callScriptFunction("_ext_set_target", self._script_h, self._OPEN)

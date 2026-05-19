@@ -6,7 +6,7 @@ State sequence:
       → GO_TO_KEY
       → PICKUP_OPEN → PICKUP_ALIGN → PICKUP_CLOSE
       → GO_TO_PLATE
-      → DROP_ALIGN → DROP_OPEN → DROP_BACKUP
+      → DROP_OPEN
       → GO_TO_DOOR → EXIT_DRIVE
       → DONE
 """
@@ -81,8 +81,6 @@ class ExplorerNode(Node):
             State.PICKUP_ALIGN: self._pickup_align,
             State.PICKUP_CLOSE: self._pickup_close,
             State.DROP_OPEN: self._drop_open,
-            State.DROP_ALIGN: self._drop_align,
-            State.DROP_BACKUP: self._drop_backup,
             State.EXIT_DRIVE: self._exit_drive,
             State.DONE: self._done,
         }
@@ -99,13 +97,9 @@ class ExplorerNode(Node):
         p("control_rate_hz", 4.0)
         p("door_threshold_inset_m", 0.20)
         p("exit_drive_speed_mps", 0.10)
-        p("exit_drive_duration_s", 5.0)
+        p("exit_drive_duration_s", 10.0)
         p("pickup_standoff_m", 0.50)
         p("pickup_engage_dist_tol_m", 0.03)
-        p("drop_backup_speed_mps", 0.05)
-        p("drop_backup_duration_s", 8.0)
-        p("plate_drop_distance_m", 0.30)
-        p("plate_drop_dist_tol_m", 0.04)
         p("park_max_speed_mps", 0.06)
         p("align_yaw_tol_rad", 0.08)
         p("align_kp", 1.5)
@@ -125,10 +119,6 @@ class ExplorerNode(Node):
         self.exit_drive_duration = float(g("exit_drive_duration_s"))
         self.pickup_standoff = float(g("pickup_standoff_m"))
         self.pickup_engage_dist_tol = float(g("pickup_engage_dist_tol_m"))
-        self.backup_speed = float(g("drop_backup_speed_mps"))
-        self.backup_duration = float(g("drop_backup_duration_s"))
-        self.drop_distance = float(g("plate_drop_distance_m"))
-        self.drop_dist_tol = float(g("plate_drop_dist_tol_m"))
         self.park_max_speed = float(g("park_max_speed_mps"))
         self.align_yaw_tol = float(g("align_yaw_tol_rad"))
         self.align_kp = float(g("align_kp"))
@@ -216,7 +206,9 @@ class ExplorerNode(Node):
             self._nav_go_to_plate()
             return
         self.stop()
-        self._transition(State.DROP_ALIGN)
+        self._transition(State.DROP_OPEN)
+        self.action_t = self.clock_s()
+        self.gripper.open()
 
     def _go_to_door(self) -> None:
         if self.nav.active:
@@ -252,28 +244,21 @@ class ExplorerNode(Node):
         elapsed = self.clock_s() - self.action_t
         if self.gripper.is_open(elapsed, self.gripper_timeout):
             self.gripper.set_cube_visible(True)
-            self._transition(State.DROP_BACKUP)
-            self.action_t = self.clock_s()
+            self._transition(State.GO_TO_DOOR)
+            self._nav_go_to_door()
 
     # ===== align-phase tick methods ===================================
 
     def _pickup_align(self) -> None:
         """P-controller: face cube, approach to pickup_engage_dist, then close."""
         if self._align(
-            self.targets["cube"], self.gripper.pickup_engage_dist,
-            self.pickup_engage_dist_tol, State.PICKUP_CLOSE,
+            self.targets["cube"],
+            self.gripper.pickup_engage_dist,
+            self.pickup_engage_dist_tol,
+            State.PICKUP_CLOSE,
         ):
             self.action_t = self.clock_s()
             self.gripper.close()
-
-    def _drop_align(self) -> None:
-        """P-controller: face plate, approach to drop_distance, then open gripper."""
-        if self._align(
-            self.targets["plate"], self.drop_distance,
-            self.drop_dist_tol, State.DROP_OPEN,
-        ):
-            self.action_t = self.clock_s()
-            self.gripper.open()
 
     def _align(
         self,
@@ -315,16 +300,6 @@ class ExplorerNode(Node):
         return False
 
     # ===== timed-drive tick methods ===================================
-
-    def _drop_backup(self) -> None:
-        if self.clock_s() - self.action_t >= self.backup_duration:
-            self.stop()
-            self._transition(State.GO_TO_DOOR)
-            self._nav_go_to_door()
-            return
-        twist = Twist()
-        twist.linear.x = -self.backup_speed
-        self.cmd_pub.publish(twist)
 
     def _exit_drive(self) -> None:
         if self.clock_s() - self.action_t >= self.exit_drive_duration:
@@ -370,7 +345,7 @@ class ExplorerNode(Node):
 
     def _nav_go_to_door(self) -> None:
         dx, dy = self.targets["door"]
-        nx, ny = self.gripper.door_normal
+        nx, ny = self._door_outward_normal(dx, dy)
         tx = dx - self.door_threshold_inset * nx
         ty = dy - self.door_threshold_inset * ny
         yaw = math.atan2(ny, nx)
@@ -381,6 +356,36 @@ class ExplorerNode(Node):
         self.nav.send(tx, ty, yaw)
 
     # ===== shared helpers ============================================
+
+    def _door_outward_normal(self, dx: float, dy: float) -> tuple[float, float]:
+        """Return cardinal outward normal of the door wall using the SLAM map.
+
+        Scans cells in each direction from the door position.  Outside the room
+        SLAM never maps, so those cells stay unknown (-1).  The direction with
+        the most unknown cells just past the door is outward.
+        """
+        info = self.current_map.info
+        res = info.resolution
+        ox = info.origin.position.x
+        oy = info.origin.position.y
+        w, h = info.width, info.height
+        data = self.current_map.data
+        cx = int((dx - ox) / res)
+        cy = int((dy - oy) / res)
+
+        def unknown_count(step_x: int, step_y: int, steps: int = 6) -> int:
+            count = 0
+            for i in range(2, steps + 2):
+                gx, gy = cx + step_x * i, cy + step_y * i
+                if gx < 0 or gy < 0 or gx >= w or gy >= h:
+                    count += 1
+                elif data[gy * w + gx] < 0:
+                    count += 1
+            return count
+
+        candidates = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        nx, ny = max(candidates, key=lambda d: unknown_count(d[0], d[1]))
+        return float(nx), float(ny)
 
     def stop(self) -> None:
         self.cmd_pub.publish(Twist())
@@ -395,9 +400,7 @@ class ExplorerNode(Node):
         x = tf.transform.translation.x
         y = tf.transform.translation.y
         q = tf.transform.rotation
-        yaw = math.atan2(
-            2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y**2 + q.z**2)
-        )
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y**2 + q.z**2))
         return float(x), float(y), float(yaw)
 
     def clock_s(self) -> float:
