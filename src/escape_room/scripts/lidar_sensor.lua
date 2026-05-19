@@ -44,6 +44,7 @@ function sysCall_init()
     )
     sim.setObjectParent(sensorHandle, sim.getObject('.'), true)
     sim.setObjectAlias(sensorHandle, 'LidarRay')
+    sim.setObjectInt32Param(sensorHandle, sim.objintparam_visibility_layer, 0) -- hide ray visual
 
     -- Precompute ray angles (-π … π exclusive endpoint).
     rayAngles = {}
