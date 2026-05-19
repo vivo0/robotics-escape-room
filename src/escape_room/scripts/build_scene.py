@@ -209,7 +209,7 @@ def build_target_cube(sim, cfg):
         static=False,
     )
     sim.setObjectSpecialProperty(h, sim.objectspecialproperty_detectable_all)
-    sim.setShapeMass(h, 0.02)
+    sim.setShapeMass(h, 0.01)
     _set_high_friction(sim, h)
     return h
 
@@ -230,9 +230,9 @@ def _set_high_friction(sim, h):
     lin_damp = getattr(sim, "bullet_body_lineardamping", None)
     ang_damp = getattr(sim, "bullet_body_angulardamping", None)
     if lin_damp is not None:
-        sim.setEngineFloatParam(lin_damp, h, 0.2)
+        sim.setEngineFloatParam(lin_damp, h, 0.4)
     if ang_damp is not None:
-        sim.setEngineFloatParam(ang_damp, h, 0.5)
+        sim.setEngineFloatParam(ang_damp, h, 0.8)
 
 
 def build_pressure_plate(sim, cfg):
