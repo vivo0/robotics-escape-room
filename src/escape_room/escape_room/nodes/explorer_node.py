@@ -77,6 +77,7 @@ class ExplorerNode(Node):
         self._lunge_active: bool = False
         self._lunge_start: tuple[float, float] | None = None
         self._lunge_dist: float = 0.0
+        self._backup_start: tuple[float, float] | None = None
 
         self._handlers = {
             State.EXPLORE: self._explore,
@@ -86,7 +87,9 @@ class ExplorerNode(Node):
             State.PICKUP_OPEN: self._pickup_open,
             State.PICKUP_ALIGN: self._pickup_align,
             State.PICKUP_CLOSE: self._pickup_close,
+            State.DROP_ALIGN: self._drop_align,
             State.DROP_OPEN: self._drop_open,
+            State.DROP_BACKUP: self._drop_backup,
             State.EXIT_DRIVE: self._exit_drive,
             State.DONE: self._done,
         }
@@ -119,9 +122,15 @@ class ExplorerNode(Node):
         # (the 0.20 m column's base clips out of frame nearer than this) and
         # commit to a straight, odometry-measured final approach.
         p("pickup_lunge_start_m", 0.90)
-        # Stop the lunge this much short so the gripper closes just before the
-        # cube instead of nudging it.
-        p("pickup_lunge_margin_m", 0.05)
+        # Stop the lunge this much short of the engage distance. Too large
+        # and the cube is gripped at the fingertips (weak friction hold → it
+        # falls while driving, and is carried too far forward); too small and
+        # the approach nudges the thin column over. The carried cube sits
+        # ~(engage + this) ahead of base_link, which the plate drop reuses.
+        p("pickup_lunge_margin_m", 0.03)
+        # After dropping, reverse this far before turning so the gripper
+        # clears the cube instead of sweeping it off the plate.
+        p("drop_backup_m", 0.25)
 
         def g(n):
             return self.get_parameter(n).value
@@ -145,6 +154,7 @@ class ExplorerNode(Node):
         self.cube_live_timeout = float(g("cube_live_timeout_s"))
         self.pickup_lunge_start = float(g("pickup_lunge_start_m"))
         self.pickup_lunge_margin = float(g("pickup_lunge_margin_m"))
+        self.drop_backup_dist = float(g("drop_backup_m"))
 
     # ===== ROS callbacks =============================================
 
@@ -237,9 +247,7 @@ class ExplorerNode(Node):
             self._nav_go_to_plate()
             return
         self.stop()
-        self._transition(State.DROP_OPEN)
-        self.action_t = self.clock_s()
-        self.gripper.open()
+        self._transition(State.DROP_ALIGN)
 
     def _go_to_door(self) -> None:
         if self.nav.active:
@@ -270,13 +278,63 @@ class ExplorerNode(Node):
             self._transition(State.GO_TO_PLATE)
             self._nav_go_to_plate()
 
+    def _drop_align(self) -> None:
+        """Place the carried cube on the plate centre.
+
+        Nav2 stops base_link only within its 0.25 m goal tolerance, and the
+        cube sits ``engage_dist`` ahead of base_link — so a plain drop lands
+        the cube short of / beside the plate. Here we drive base_link to
+        exactly ``engage_dist`` from the perceived plate, facing it, so the
+        gripper is over the plate centre, then open."""
+        pose = self.get_robot_pose()
+        if pose is None:
+            return
+        rx, ry, ryaw = pose
+        px, py = self.targets["plate"]
+        c, s = math.cos(-ryaw), math.sin(-ryaw)
+        dx, dy = px - rx, py - ry
+        bx, by = c * dx - s * dy, s * dx + c * dy   # plate in base_link
+        bearing = math.atan2(by, bx)
+        if abs(bearing) > self.align_yaw_tol:
+            self._drive(0.0, self.align_kp * bearing)
+            return
+        # The carried cube sits ~(engage + lunge margin) ahead of base_link,
+        # so stop that far from the plate to drop it on the centre.
+        carried = self.pickup_engage_dist + self.pickup_lunge_margin
+        err = math.hypot(bx, by) - carried
+        if abs(err) <= 0.03:
+            self.stop()
+            self._transition(State.DROP_OPEN)
+            self.action_t = self.clock_s()
+            self.gripper.open()
+            return
+        self._drive(0.5 * err, 0.5 * bearing)
+
     def _drop_open(self) -> None:
         self.stop()
         elapsed = self.clock_s() - self.action_t
-        if self.gripper.is_open(elapsed, self.gripper_timeout):
-            self.gripper.set_cube_visible(True)
+        if not self.gripper.is_open(elapsed, self.gripper_timeout):
+            return
+        start = self.get_odom_pose()
+        if start is None:
+            return
+        self.gripper.set_cube_visible(True)
+        self._backup_start = start
+        self._transition(State.DROP_BACKUP)
+
+    def _drop_backup(self) -> None:
+        """Reverse straight to clear the just-dropped cube before turning."""
+        pose = self.get_odom_pose()
+        if pose is None:
+            return
+        advanced = math.hypot(
+            pose[0] - self._backup_start[0], pose[1] - self._backup_start[1])
+        if advanced >= self.drop_backup_dist:
+            self.stop()
             self._transition(State.GO_TO_DOOR)
             self._nav_go_to_door()
+            return
+        self._drive(-self.park_max_speed, 0.0, cap_linear=False)
 
     # ===== align-phase tick methods ===================================
 
