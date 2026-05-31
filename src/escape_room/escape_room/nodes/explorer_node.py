@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """Mission FSM for the escape room.
 
-State sequence:
-    EXPLORE
-      → GO_TO_KEY
-      → PICKUP_OPEN → PICKUP_ALIGN → PICKUP_CLOSE
-      → GO_TO_PLATE
-      → DROP_OPEN
-      → GO_TO_DOOR → EXIT_DRIVE
-      → DONE
+Each state is one tick-method; the robot walks through them in order:
+    EXPLORE -> GO_TO_KEY
+            -> PICKUP_OPEN -> PICKUP_ALIGN -> PICKUP_CLOSE
+            -> GO_TO_PLATE -> DROP_ALIGN -> DROP_OPEN -> DROP_BACKUP
+            -> GO_TO_DOOR -> EXIT_DRIVE -> DONE
+Nav2 does the long-range driving; cmd_vel does the short precise moves.
 """
 
 from __future__ import annotations
@@ -31,6 +29,7 @@ from .explorer.state import State
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
+    # keep x inside [lo, hi] (used to cap speeds)
     return max(lo, min(hi, x))
 
 
@@ -46,6 +45,8 @@ class ExplorerNode(Node):
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
         self.nav = NavClient(self, self.map_frame)
 
+        # "latched" = keep the last message so we still get it if we
+        # subscribe after the detector already published (transient local).
         latched = QoSProfile(
             depth=1,
             reliability=QoSReliabilityPolicy.RELIABLE,
@@ -53,6 +54,8 @@ class ExplorerNode(Node):
         )
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self.goal_pub = self.create_publisher(PoseStamped, "/exploration/goal", 10)
+        # one callback for all three target topics; n=name binds the loop
+        # variable now (otherwise every lambda would see the last name).
         for name in ("cube", "plate", "door"):
             self.create_subscription(
                 PoseStamped,
@@ -66,11 +69,11 @@ class ExplorerNode(Node):
         )
         self.create_subscription(OccupancyGrid, "/map", self._on_map, latched)
 
-        self.targets: dict[str, tuple[float, float]] = {}
+        self.targets: dict[str, tuple[float, float]] = {}  # name -> (x, y) in map
         self.mode: State = State.EXPLORE
-        self.action_t: float = 0.0
+        self.action_t: float = 0.0          # time a timed action started
         self.current_map: OccupancyGrid | None = None
-        self._started: bool = False
+        self._started: bool = False         # becomes True once Nav2/TF are up
         # Latest cube detection in base_link: (x_fwd, y_left, stamp_s).
         self._cube_live: tuple[float, float, float] | None = None
         # Odometry-measured final-approach ("lunge") state.
@@ -79,6 +82,7 @@ class ExplorerNode(Node):
         self._lunge_dist: float = 0.0
         self._backup_start: tuple[float, float] | None = None
 
+        # map each state to the method that runs every tick while in it
         self._handlers = {
             State.EXPLORE: self._explore,
             State.GO_TO_KEY: self._go_to_key,
@@ -94,6 +98,7 @@ class ExplorerNode(Node):
             State.DONE: self._done,
         }
 
+        # the whole FSM runs on this fixed-rate timer
         self.create_timer(1.0 / self.control_rate_hz, self._tick)
         self.get_logger().info("ready; waiting for Nav2 and slam_toolbox...")
 
@@ -162,6 +167,8 @@ class ExplorerNode(Node):
         self.current_map = msg
 
     def _on_target(self, name: str, msg: PoseStamped) -> None:
+        # the detector re-publishes a refined pose every frame; ignore small
+        # jitter and only log when it actually moved (> 0.1 m)
         x, y = msg.pose.position.x, msg.pose.position.y
         if name in self.targets:
             ox, oy = self.targets[name]
@@ -187,6 +194,7 @@ class ExplorerNode(Node):
     # ===== FSM dispatcher ============================================
 
     def _tick(self) -> None:
+        # wait until everything is up, then just run the current state's method
         if not self._started:
             if self._is_ready():
                 self._started = True
@@ -195,6 +203,7 @@ class ExplorerNode(Node):
         self._handlers[self.mode]()
 
     def _is_ready(self) -> bool:
+        # need the Nav2 action server, a map, and a valid robot pose (TF)
         return (
             self.nav.server_ready
             and self.current_map is not None
@@ -204,12 +213,14 @@ class ExplorerNode(Node):
     # ===== nav-phase tick methods =====================================
 
     def _explore(self) -> None:
+        # found all three landmarks? stop exploring and go grab the cube
         if len(self.targets) == 3:
             self._transition(State.GO_TO_KEY)
             self._nav_go_to_key()
             return
-        if self.nav.active:
+        if self.nav.active:        # already driving to a frontier, let it finish
             return
+        # frontiers = boundary cells between known free space and the unknown
         frontiers = compute_frontiers(self.current_map)
         if not frontiers:
             self.get_logger().info(
@@ -220,12 +231,15 @@ class ExplorerNode(Node):
         if pose is None:
             return
         rx, ry, _ = pose
+        # greedily head for the closest frontier, facing it
         fx, fy = min(frontiers, key=lambda f: math.hypot(f[0] - rx, f[1] - ry))
         yaw = math.atan2(fy - ry, fx - rx)
         self.publish_nav_goal(fx, fy, yaw)
         self.nav.send(fx, fy, yaw)
 
     def _go_to_key(self) -> None:
+        # same pattern for every nav phase: wait while driving, retry on
+        # failure (Nav2 sometimes aborts near walls), act once it succeeds
         if self.nav.active:
             return
         if not self.nav.succeeded:
@@ -233,11 +247,11 @@ class ExplorerNode(Node):
             self._nav_go_to_key()
             return
         self.stop()
-        self._lunge_active = False
+        self._lunge_active = False     # reset lunge state for a fresh pickup
         self._lunge_start = None
         self._transition(State.PICKUP_OPEN)
         self.action_t = self.clock_s()
-        self.gripper.open()
+        self.gripper.open()            # open early so we approach ready to grab
 
     def _go_to_plate(self) -> None:
         if self.nav.active:
@@ -247,7 +261,7 @@ class ExplorerNode(Node):
             self._nav_go_to_plate()
             return
         self.stop()
-        self._transition(State.DROP_ALIGN)
+        self._transition(State.DROP_ALIGN)   # Nav2 got us close; align precisely
 
     def _go_to_door(self) -> None:
         if self.nav.active:
@@ -265,6 +279,7 @@ class ExplorerNode(Node):
     # ===== gripper-wait tick methods ==================================
 
     def _pickup_open(self) -> None:
+        # stand still until the jaws report fully open, then start aligning
         self.stop()
         elapsed = self.clock_s() - self.action_t
         if self.gripper.is_open(elapsed, self.gripper_timeout):
@@ -274,41 +289,40 @@ class ExplorerNode(Node):
         self.stop()
         elapsed = self.clock_s() - self.action_t
         if self.gripper.is_closed(elapsed, self.gripper_timeout):
+            # hide the carried cube from the lidar so it isn't mapped as an
+            # obstacle stuck in front of us, then carry it to the plate
             self.gripper.set_cube_visible(False)
             self._transition(State.GO_TO_PLATE)
             self._nav_go_to_plate()
 
     def _drop_align(self) -> None:
-        """Place the carried cube on the plate centre.
-
-        Nav2 stops base_link only within its 0.25 m goal tolerance, and the
-        cube sits ``engage_dist`` ahead of base_link — so a plain drop lands
-        the cube short of / beside the plate. Here we drive base_link to
-        exactly ``engage_dist`` from the perceived plate, facing it, so the
-        gripper is over the plate centre, then open."""
+        # Nav2's 0.25 m tolerance is too loose to drop on a 0.3 m plate, so
+        # we finish with cmd_vel: face the plate and stop so the gripper (which
+        # holds the cube ahead of us) ends up over the plate centre.
         pose = self.get_robot_pose()
         if pose is None:
             return
         rx, ry, ryaw = pose
         px, py = self.targets["plate"]
+        # express the plate in base_link: translate, then rotate by -yaw
         c, s = math.cos(-ryaw), math.sin(-ryaw)
         dx, dy = px - rx, py - ry
-        bx, by = c * dx - s * dy, s * dx + c * dy   # plate in base_link
+        bx, by = c * dx - s * dy, s * dx + c * dy   # x = forward, y = left
         bearing = math.atan2(by, bx)
-        if abs(bearing) > self.align_yaw_tol:
+        if abs(bearing) > self.align_yaw_tol:       # not facing it yet: turn
             self._drive(0.0, self.align_kp * bearing)
             return
-        # The carried cube sits ~(engage + lunge margin) ahead of base_link,
-        # so stop that far from the plate to drop it on the centre.
+        # the cube is carried ~(engage + lunge margin) ahead, so base_link must
+        # stop that far from the plate for the cube to land on the centre
         carried = self.pickup_engage_dist + self.pickup_lunge_margin
         err = math.hypot(bx, by) - carried
-        if abs(err) <= 0.03:
+        if abs(err) <= 0.03:                         # close enough: drop it
             self.stop()
             self._transition(State.DROP_OPEN)
             self.action_t = self.clock_s()
             self.gripper.open()
             return
-        self._drive(0.5 * err, 0.5 * bearing)
+        self._drive(0.5 * err, 0.5 * bearing)        # P-control on distance + yaw
 
     def _drop_open(self) -> None:
         self.stop()
@@ -316,14 +330,15 @@ class ExplorerNode(Node):
         if not self.gripper.is_open(elapsed, self.gripper_timeout):
             return
         start = self.get_odom_pose()
-        if start is None:
+        if start is None:                  # need an odom start to measure backup
             return
-        self.gripper.set_cube_visible(True)
+        self.gripper.set_cube_visible(True)   # cube is on the plate now: show it
         self._backup_start = start
         self._transition(State.DROP_BACKUP)
 
     def _drop_backup(self) -> None:
-        """Reverse straight to clear the just-dropped cube before turning."""
+        # the gripper is still over the cube; if we turned now we'd knock it off
+        # the plate, so first reverse straight a bit, measured in odom
         pose = self.get_odom_pose()
         if pose is None:
             return
@@ -334,37 +349,38 @@ class ExplorerNode(Node):
             self._transition(State.GO_TO_DOOR)
             self._nav_go_to_door()
             return
-        self._drive(-self.park_max_speed, 0.0, cap_linear=False)
+        self._drive(-self.park_max_speed, 0.0, cap_linear=False)  # straight back
 
     # ===== align-phase tick methods ===================================
 
     def _pickup_align(self) -> None:
-        """Visual servoing onto the cube (perception only).
-
-        Centre the live ``/targets/cube_live`` bearing, then approach. The
-        height-based monocular range is trusted only while the whole column is
-        in frame; once centred and within ``pickup_lunge_start`` we hand off to
-        ``_pickup_lunge`` (a straight, odometry-measured final approach)."""
+        # Visual servoing on the cube: turn to centre it, drive up to it, and
+        # hand off to the lunge for the last stretch (perception only, the
+        # cube_live pose is already in base_link).
         if self._lunge_active:
             self._pickup_lunge()
             return
-        if not self._cube_fresh():
+        if not self._cube_fresh():        # no recent detection: wait, don't guess
             return
 
         bx, by, _ = self._cube_live
-        rng = math.hypot(bx, by)
-        bearing = math.atan2(by, bx)
+        rng = math.hypot(bx, by)          # distance to cube
+        bearing = math.atan2(by, bx)      # angle to cube (0 = straight ahead)
 
         if abs(bearing) > self.align_yaw_tol:
-            self._drive(0.0, self.align_kp * bearing)
+            self._drive(0.0, self.align_kp * bearing)   # rotate to face it first
             return
 
+        # Close enough that the cube's base will soon clip out of the camera
+        # (its pixel height shrinks → range gets unreliable). So freeze the
+        # remaining distance now and finish it open-loop on odometry.
         if rng <= self.pickup_lunge_start:
             start = self.get_odom_pose()
             if start is None:
                 return
             self._lunge_active = True
             self._lunge_start = start
+            # leave a small margin so we stop just before the cube
             self._lunge_dist = max(
                 0.0, rng - self.pickup_engage_dist - self.pickup_lunge_margin)
             self.stop()
@@ -372,14 +388,13 @@ class ExplorerNode(Node):
                 f"pickup: {self._lunge_dist:.2f} m straight approach")
             return
 
+        # still far: drive forward (capped) while keeping centred
         self._drive(0.5 * (rng - self.pickup_engage_dist), 0.5 * bearing)
 
     def _pickup_lunge(self) -> None:
-        """Straight, odometry-measured final approach, then close the gripper.
-
-        Advances ``_lunge_dist`` in the smooth odom frame; while the cube is
-        still visible its bearing keeps the heading centred, then the last few
-        centimetres (cube below the camera FOV) are dead-straight."""
+        # Drive straight until odometry says we've advanced _lunge_dist, then
+        # close. Odom is used (not the map/SLAM pose) because it's smooth over
+        # this short move; the camera range can't be trusted this close.
         pose = self.get_odom_pose()
         if pose is None:
             return
@@ -390,16 +405,19 @@ class ExplorerNode(Node):
             self._lunge_active = False
             self._engage_cube()
             return
+        # keep nudging the heading while the cube is still visible, else go straight
         bearing = math.atan2(self._cube_live[1], self._cube_live[0]) \
             if self._cube_fresh() else 0.0
         self._drive(self.park_max_speed, 0.5 * bearing, cap_linear=False)
 
     def _cube_fresh(self) -> bool:
+        # True if we have a cube detection from within the last timeout window
         return (self._cube_live is not None
                 and self.clock_s() - self._cube_live[2] <= self.cube_live_timeout)
 
     def _drive(self, linear: float, angular: float,
                cap_linear: bool = True) -> None:
+        # publish one velocity command, clamping so we never go too fast
         twist = Twist()
         twist.linear.x = (_clamp(linear, -self.park_max_speed, self.park_max_speed)
                           if cap_linear else linear)
@@ -407,7 +425,7 @@ class ExplorerNode(Node):
         self.cmd_pub.publish(twist)
 
     def _engage_cube(self) -> None:
-        """Close the gripper on the cube and advance the FSM."""
+        # close the jaws and move on to wait for them to finish closing
         self._transition(State.PICKUP_CLOSE)
         self.action_t = self.clock_s()
         self.gripper.close()
@@ -415,6 +433,7 @@ class ExplorerNode(Node):
     # ===== timed-drive tick methods ===================================
 
     def _exit_drive(self) -> None:
+        # just drive forward through the open door for a fixed time, then done
         if self.clock_s() - self.action_t >= self.exit_drive_duration:
             self.stop()
             self._transition(State.DONE)
@@ -427,6 +446,7 @@ class ExplorerNode(Node):
     # ===== state transition + nav goal helpers =======================
 
     def _transition(self, state: State) -> None:
+        # cancel any running Nav2 goal so it can't fire after we've moved on
         self.get_logger().info(f"{self.mode} → {state}")
         self.nav.cancel()
         self.mode = state
@@ -437,7 +457,8 @@ class ExplorerNode(Node):
             return
         rx, ry, _ = pose
         cx, cy = self.targets["cube"]
-        yaw = math.atan2(cy - ry, cx - rx)
+        yaw = math.atan2(cy - ry, cx - rx)          # heading from robot to cube
+        # don't drive onto the cube: stop pickup_standoff short of it, facing it
         sx = cx - self.pickup_standoff * math.cos(yaw)
         sy = cy - self.pickup_standoff * math.sin(yaw)
         self.publish_nav_goal(sx, sy, yaw)
@@ -455,7 +476,8 @@ class ExplorerNode(Node):
 
     def _nav_go_to_door(self) -> None:
         dx, dy = self.targets["door"]
-        nx, ny = self._door_outward_normal(dx, dy)
+        nx, ny = self._door_outward_normal(dx, dy)   # which way is "out"
+        # aim just inside the doorway, pointing outward, then EXIT_DRIVE pushes through
         tx = dx - self.door_threshold_inset * nx
         ty = dy - self.door_threshold_inset * ny
         yaw = math.atan2(ny, nx)
@@ -468,28 +490,27 @@ class ExplorerNode(Node):
     # ===== shared helpers ============================================
 
     def _door_outward_normal(self, dx: float, dy: float) -> tuple[float, float]:
-        """Return cardinal outward normal of the door wall using the SLAM map.
-
-        Scans cells in each direction from the door position.  Outside the room
-        SLAM never maps, so those cells stay unknown (-1).  The direction with
-        the most unknown cells just past the door is outward.
-        """
+        # Which side of the door is "outside"? SLAM never maps outside the
+        # room, so those cells stay unknown (-1). Look a few cells past the
+        # door in each cardinal direction; the one with the most unknown
+        # cells points outward.
         info = self.current_map.info
         res = info.resolution
         ox = info.origin.position.x
         oy = info.origin.position.y
         w, h = info.width, info.height
         data = self.current_map.data
-        cx = int((dx - ox) / res)
+        cx = int((dx - ox) / res)        # door position as grid cell
         cy = int((dy - oy) / res)
 
         def unknown_count(step_x: int, step_y: int, steps: int = 6) -> int:
+            # count unknown/off-map cells walking outward from the door
             count = 0
             for i in range(2, steps + 2):
                 gx, gy = cx + step_x * i, cy + step_y * i
                 if gx < 0 or gy < 0 or gx >= w or gy >= h:
                     count += 1
-                elif data[gy * w + gx] < 0:
+                elif data[gy * w + gx] < 0:      # -1 = unknown in the grid
                     count += 1
             return count
 
@@ -498,9 +519,10 @@ class ExplorerNode(Node):
         return float(nx), float(ny)
 
     def stop(self) -> None:
-        self.cmd_pub.publish(Twist())
+        self.cmd_pub.publish(Twist())     # empty Twist = zero velocity
 
     def get_robot_pose(self) -> tuple[float, float, float] | None:
+        # robot pose in the map frame (from SLAM via TF); None if TF not ready
         try:
             tf = self._tf_buffer.lookup_transform(
                 self.map_frame, self.base_frame, Time(), timeout=Duration(seconds=0.1)
@@ -510,12 +532,13 @@ class ExplorerNode(Node):
         x = tf.transform.translation.x
         y = tf.transform.translation.y
         q = tf.transform.rotation
+        # yaw from quaternion (z-axis rotation only, the robot is planar)
         yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y**2 + q.z**2))
         return float(x), float(y), float(yaw)
 
     def get_odom_pose(self) -> tuple[float, float] | None:
-        """Robot position in the odom frame (smooth, no SLAM jumps) — used to
-        measure short open-loop advances during the pickup lunge."""
+        # position in the odom frame: drifts slowly but is smooth (no SLAM
+        # jumps), which is what we want for measuring a short straight move
         try:
             tf = self._tf_buffer.lookup_transform(
                 self.odom_frame, self.base_frame, Time(),
@@ -526,14 +549,16 @@ class ExplorerNode(Node):
         return float(tf.transform.translation.x), float(tf.transform.translation.y)
 
     def clock_s(self) -> float:
-        return self.get_clock().now().nanoseconds * 1e-9
+        return self.get_clock().now().nanoseconds * 1e-9   # ROS time in seconds
 
     def publish_nav_goal(self, x: float, y: float, yaw: float) -> None:
+        # publish the goal as an arrow for RViz (Nav2 itself is sent via NavClient)
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.map_frame
         msg.pose.position.x = x
         msg.pose.position.y = y
+        # yaw -> quaternion (again only z because the robot is flat on the floor)
         msg.pose.orientation.w = math.cos(yaw / 2.0)
         msg.pose.orientation.z = math.sin(yaw / 2.0)
         self.goal_pub.publish(msg)
