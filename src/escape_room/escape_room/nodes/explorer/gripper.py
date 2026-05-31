@@ -1,20 +1,14 @@
-"""CoppeliaSim gripper I/O and scene-geometry initialisation."""
+"""CoppeliaSim gripper I/O: open/close the jaws and toggle cube visibility.
+
+The cube's detectable flag is cleared while carried so the lidar does not
+report a stationary obstacle directly in front of base_link.
+"""
 
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 
 
 class GripperIO:
-    """Wraps the CoppeliaSim gripper script and cube lidar-visibility toggle.
-
-    Also reads two pose-independent geometry constants from the scene at
-    construction time and exposes them as attributes:
-
-      ``pickup_engage_dist`` — attachPoint x-offset from BaseLinkFrame (m).
-      ``door_normal``        — outward unit normal of the door panel (cardinal).
-
-    The cube's detectable flag is cleared while carried so the lidar does not
-    report a stationary obstacle directly in front of base_link.
-    """
+    """Wraps the CoppeliaSim gripper script and cube lidar-visibility toggle."""
 
     _OPEN = 1
     _CLOSE = 2
@@ -29,14 +23,6 @@ class GripperIO:
         self._sim = sim
         self._script_h = sim.getScript(1, gripper_h)
         self._cube_h = sim.getObject(cube_alias)
-
-        attach_h = self._find_in_tree(sim, model_h, "attachPoint")
-        base_h = self._find_in_tree(sim, model_h, "BaseLinkFrame")
-        self.pickup_engage_dist: float = float(
-            sim.getObjectPosition(attach_h, base_h)[0]
-        )
-
-        logger.info(f"pickup_engage_dist = {self.pickup_engage_dist:.3f} m")
 
     def open(self) -> None:
         self._sim.callScriptFunction("_ext_set_target", self._script_h, self._OPEN)

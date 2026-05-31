@@ -77,7 +77,6 @@ class ExplorerNode(Node):
         self._lunge_active: bool = False
         self._lunge_start: tuple[float, float] | None = None
         self._lunge_dist: float = 0.0
-        self._lunge_t0: float = 0.0
 
         self._handlers = {
             State.EXPLORE: self._explore,
@@ -107,24 +106,21 @@ class ExplorerNode(Node):
         p("exit_drive_speed_mps", 0.10)
         p("exit_drive_duration_s", 10.0)
         p("pickup_standoff_m", 0.90)
-        p("pickup_engage_dist_tol_m", 0.03)
         p("park_max_speed_mps", 0.06)
         p("align_yaw_tol_rad", 0.08)
         p("align_kp", 1.5)
         p("align_max_omega", 0.6)
         p("gripper_timeout_s", 4.0)
-        # Visual-servoing pickup (perception-only, no ground truth).
+        # Visual-servoing pickup (perception only). engage_dist is the
+        # attachPoint offset from base_link (a fixed robot geometry constant).
+        p("pickup_engage_dist_m", 0.177)
         p("cube_live_timeout_s", 0.8)
-        p("pickup_search_omega", 0.3)
-        # Range at which we stop trusting the (height-based) monocular depth
-        # and commit to an odometry-measured straight final approach. The
-        # cube is a 0.20 m column; nearer than this its base clips out of the
-        # camera's bottom edge, shrinking its pixel height and inflating the
-        # estimated range — which would drive the robot through the cube.
+        # Range at which we stop trusting the height-based monocular depth
+        # (the 0.20 m column's base clips out of frame nearer than this) and
+        # commit to a straight, odometry-measured final approach.
         p("pickup_lunge_start_m", 0.90)
-        # Stop the straight lunge this much short of the computed engage
-        # distance, so the gripper closes just before reaching the cube
-        # rather than nudging it forward.
+        # Stop the lunge this much short so the gripper closes just before the
+        # cube instead of nudging it.
         p("pickup_lunge_margin_m", 0.05)
 
         def g(n):
@@ -140,14 +136,13 @@ class ExplorerNode(Node):
         self.exit_drive_speed = float(g("exit_drive_speed_mps"))
         self.exit_drive_duration = float(g("exit_drive_duration_s"))
         self.pickup_standoff = float(g("pickup_standoff_m"))
-        self.pickup_engage_dist_tol = float(g("pickup_engage_dist_tol_m"))
         self.park_max_speed = float(g("park_max_speed_mps"))
         self.align_yaw_tol = float(g("align_yaw_tol_rad"))
         self.align_kp = float(g("align_kp"))
         self.align_max_omega = float(g("align_max_omega"))
         self.gripper_timeout = float(g("gripper_timeout_s"))
+        self.pickup_engage_dist = float(g("pickup_engage_dist_m"))
         self.cube_live_timeout = float(g("cube_live_timeout_s"))
-        self.pickup_search_omega = float(g("pickup_search_omega"))
         self.pickup_lunge_start = float(g("pickup_lunge_start_m"))
         self.pickup_lunge_margin = float(g("pickup_lunge_margin_m"))
 
@@ -286,31 +281,16 @@ class ExplorerNode(Node):
     # ===== align-phase tick methods ===================================
 
     def _pickup_align(self) -> None:
-        """Visual servoing onto the cube using perception only.
+        """Visual servoing onto the cube (perception only).
 
-        Drives on the live ``/targets/cube_live`` bearing (base_link): turns
-        to centre the cube, then approaches. The monocular range (from the
-        cube's pixel height) is trustworthy only while the whole column is in
-        frame; closer than ``pickup_lunge_start`` its base clips out of the
-        bottom edge and the range balloons. So once centred and within that
-        range we commit to ``_pickup_lunge``: a straight, odometry-measured
-        final approach that ignores the (now unreliable) range. No
-        map/ground-truth cube coordinate is used."""
+        Centre the live ``/targets/cube_live`` bearing, then approach. The
+        height-based monocular range is trusted only while the whole column is
+        in frame; once centred and within ``pickup_lunge_start`` we hand off to
+        ``_pickup_lunge`` (a straight, odometry-measured final approach)."""
         if self._lunge_active:
             self._pickup_lunge()
             return
-
-        engage = self.gripper.pickup_engage_dist
-        now = self.clock_s()
-        fresh = (
-            self._cube_live is not None
-            and now - self._cube_live[2] <= self.cube_live_timeout
-        )
-        if not fresh:
-            # Lost / never acquired: rotate slowly to search.
-            twist = Twist()
-            twist.angular.z = self.pickup_search_omega
-            self.cmd_pub.publish(twist)
+        if not self._cube_fresh():
             return
 
         bx, by, _ = self._cube_live
@@ -318,72 +298,54 @@ class ExplorerNode(Node):
         bearing = math.atan2(by, bx)
 
         if abs(bearing) > self.align_yaw_tol:
-            twist = Twist()
-            twist.angular.z = _clamp(
-                self.align_kp * bearing,
-                -self.align_max_omega,
-                self.align_max_omega,
-            )
-            self.cmd_pub.publish(twist)
+            self._drive(0.0, self.align_kp * bearing)
             return
 
-        # Centred and close enough: commit to the odometry-measured lunge.
         if rng <= self.pickup_lunge_start:
-            pose = self.get_odom_pose()
-            if pose is None:
-                self.stop()
-                self.get_logger().warn("pickup: odom TF unavailable, waiting")
+            start = self.get_odom_pose()
+            if start is None:
                 return
             self._lunge_active = True
-            self._lunge_start = (pose[0], pose[1])
-            self._lunge_dist = max(0.0, rng - engage - self.pickup_lunge_margin)
-            self._lunge_t0 = now
+            self._lunge_start = start
+            self._lunge_dist = max(
+                0.0, rng - self.pickup_engage_dist - self.pickup_lunge_margin)
             self.stop()
             self.get_logger().info(
-                f"pickup: committing to {self._lunge_dist:.2f} m straight "
-                f"approach (range {rng:.2f} m)")
+                f"pickup: {self._lunge_dist:.2f} m straight approach")
             return
 
-        # Approach forward while keeping centred.
-        twist = Twist()
-        twist.linear.x = _clamp(
-            0.5 * (rng - engage), -self.park_max_speed, self.park_max_speed
-        )
-        twist.angular.z = 0.5 * bearing
-        self.cmd_pub.publish(twist)
+        self._drive(0.5 * (rng - self.pickup_engage_dist), 0.5 * bearing)
 
     def _pickup_lunge(self) -> None:
-        """Straight, odometry-measured final approach to the cube.
+        """Straight, odometry-measured final approach, then close the gripper.
 
-        Drives forward until the robot has advanced ``_lunge_dist`` (measured
-        in the smooth ``odom`` frame), then closes the gripper. While the cube
-        is still visible its bearing keeps steering the heading; for the last
-        few centimetres (cube below the camera FOV) it drives dead-straight.
-        A time-out guards against a stalled odom lookup."""
-        now = self.clock_s()
+        Advances ``_lunge_dist`` in the smooth odom frame; while the cube is
+        still visible its bearing keeps the heading centred, then the last few
+        centimetres (cube below the camera FOV) are dead-straight."""
         pose = self.get_odom_pose()
-        advanced = 0.0
-        if pose is not None and self._lunge_start is not None:
-            advanced = math.hypot(
-                pose[0] - self._lunge_start[0], pose[1] - self._lunge_start[1])
-        timeout = self._lunge_dist / max(self.park_max_speed, 1e-3) + 4.0
-
-        if advanced >= self._lunge_dist or now - self._lunge_t0 > timeout:
+        if pose is None:
+            return
+        advanced = math.hypot(
+            pose[0] - self._lunge_start[0], pose[1] - self._lunge_start[1])
+        if advanced >= self._lunge_dist:
             self.stop()
             self._lunge_active = False
             self._engage_cube()
             return
+        bearing = math.atan2(self._cube_live[1], self._cube_live[0]) \
+            if self._cube_fresh() else 0.0
+        self._drive(self.park_max_speed, 0.5 * bearing, cap_linear=False)
 
+    def _cube_fresh(self) -> bool:
+        return (self._cube_live is not None
+                and self.clock_s() - self._cube_live[2] <= self.cube_live_timeout)
+
+    def _drive(self, linear: float, angular: float,
+               cap_linear: bool = True) -> None:
         twist = Twist()
-        twist.linear.x = self.park_max_speed
-        if (self._cube_live is not None
-                and now - self._cube_live[2] <= self.cube_live_timeout):
-            bx, by, _ = self._cube_live
-            twist.angular.z = _clamp(
-                0.5 * math.atan2(by, bx),
-                -self.align_max_omega,
-                self.align_max_omega,
-            )
+        twist.linear.x = (_clamp(linear, -self.park_max_speed, self.park_max_speed)
+                          if cap_linear else linear)
+        twist.angular.z = _clamp(angular, -self.align_max_omega, self.align_max_omega)
         self.cmd_pub.publish(twist)
 
     def _engage_cube(self) -> None:
@@ -414,7 +376,6 @@ class ExplorerNode(Node):
     def _nav_go_to_key(self) -> None:
         pose = self.get_robot_pose()
         if pose is None:
-            self.get_logger().warn("go_to_key: TF unavailable, nav goal deferred")
             return
         rx, ry, _ = pose
         cx, cy = self.targets["cube"]
@@ -425,14 +386,12 @@ class ExplorerNode(Node):
         self.nav.send(sx, sy, yaw)
 
     def _nav_go_to_plate(self) -> None:
-        px, py = self.targets["plate"]
         pose = self.get_robot_pose()
-        if pose is not None:
-            rx, ry, _ = pose
-            yaw = math.atan2(py - ry, px - rx)
-        else:
-            yaw = 0.0
-            self.get_logger().warn("go_to_plate: TF unavailable, yaw=0.0")
+        if pose is None:
+            return
+        rx, ry, _ = pose
+        px, py = self.targets["plate"]
+        yaw = math.atan2(py - ry, px - rx)
         self.publish_nav_goal(px, py, yaw)
         self.nav.send(px, py, yaw)
 
