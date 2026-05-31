@@ -30,7 +30,6 @@ setup(
     entry_points={
         "console_scripts": [
             "door_controller = escape_room.nodes.door_controller:main",
-            "lidar_node = escape_room.nodes.lidar_node:main",
             "explorer_node = escape_room.nodes.explorer_node:main",
             "color_detector_node = escape_room.nodes.color_detector_node:main",
         ],
