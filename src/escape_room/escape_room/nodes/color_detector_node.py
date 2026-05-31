@@ -7,24 +7,30 @@ Looks for three coloured landmarks in the robot's camera image:
     plate (green square)   → sim alias /PressurePlate
     door  (blue rectangle) → sim alias /Door_0
 
-The largest HSV-matching connected component is the detection. The
-first time a target clears its pixel threshold we:
+The largest HSV-matching connected component is the detection.
 
-1. Retrieve its world position from CoppeliaSim (sim truth).
-2. Express that position in base_link frame using the robot's current
-   world pose (also from sim).
-3. Transform base_link → map using the live TF tree.
-4. Publish the result as a latched PoseStamped in the map frame.
+The **cube** is localised purely from perception (no sim ground truth):
+the blob centroid is back-projected through the pinhole model, depth is
+recovered monocularly from the known cube size, and the resulting 3D point
+in ``camera_optical_link`` is transformed via the live TF tree. It is
+published continuously in ``base_link`` on ``/targets/cube_live`` (for the
+explorer's visual-servoing pickup) and once in ``map`` on ``/targets/cube``
+(so Nav2 can drive to the standoff). The cube handle is never queried.
 
-If the map→odom TF is not yet available when a target is first detected,
+The **plate** and **door** still use sim truth (they only seed coarse Nav2
+goals, not a precise grasp): world position from CoppeliaSim → base_link via
+the robot's sim pose → map via TF → latched PoseStamped.
+
+If the required TF is not yet available when a target is first detected,
 the detection is stored in _pending and retried on every subsequent image
 frame until the transform succeeds.
 
 Subscribes:
     /camera/image_color    (sensor_msgs/Image)
 
-Publishes (latched):
-    /targets/{cube,plate,door}  (geometry_msgs/PoseStamped, frame: map)
+Publishes:
+    /targets/cube_live          (geometry_msgs/PoseStamped, frame: base_link)
+    /targets/{cube,plate,door}  (geometry_msgs/PoseStamped, frame: map, latched)
     /targets/markers            (visualization_msgs/MarkerArray,  frame: map)
 """
 from __future__ import annotations
@@ -42,8 +48,9 @@ from rclpy.node import Node
 from rclpy.qos import (QoSDurabilityPolicy, QoSProfile,
                        QoSReliabilityPolicy)
 
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PointStamped, PoseStamped
 from sensor_msgs.msg import Image
+from tf2_geometry_msgs import do_transform_point
 from visualization_msgs.msg import Marker, MarkerArray
 
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
@@ -75,15 +82,26 @@ class ColorTarget:
 
 
 # Cube is magenta (not red, which causes artefacts; not yellow,
-# which the default floor pattern uses).
-_TARGETS: tuple[ColorTarget, ...] = (
-    ColorTarget('cube',  '/TargetCube',     80, (0.9, 0.1, 0.9), 0.12,
-                [_hsv_range(140, 170)]),
+# which the default floor pattern uses). It is localised by perception
+# only, so its sim_alias is unused. The "cube" is a thin upright column
+# (0.03 x 0.03 x 0.20 m); monocular depth uses its 0.20 m HEIGHT, which
+# projects to a far larger, more stable pixel extent than its 0.03 m width.
+_CUBE: ColorTarget = ColorTarget(
+    'cube', '/TargetCube', 80, (0.9, 0.1, 0.9), 0.20, [_hsv_range(140, 170)])
+
+# Plate and door still use sim truth (coarse Nav2 seeds only).
+_SIM_TARGETS: tuple[ColorTarget, ...] = (
     ColorTarget('plate', '/PressurePlate', 200, (0.1, 1.0, 0.1), 0.30,
                 [_hsv_range(40, 80)]),
     ColorTarget('door',  '/Door_0',        300, (0.1, 0.3, 1.0), 0.80,
                 [_hsv_range(100, 130)]),
 )
+
+# Full set, used only for publisher/marker bookkeeping.
+_TARGETS: tuple[ColorTarget, ...] = (_CUBE, *_SIM_TARGETS)
+
+_CAMERA_FRAME = 'camera_optical_link'
+_BASE_FRAME = 'base_link'
 
 
 class ColorDetectorNode(Node):
@@ -117,8 +135,17 @@ class ColorDetectorNode(Node):
                 f"target localisation will fail")
             self._robot_handle = None
 
+        # Diagnostic only: ground-truth cube pose, used solely to log the
+        # perception error (never fed to navigation or the gripper).
+        try:
+            self._cube_truth_handle: int | None = self.sim.getObject(
+                '/TargetCube')
+        except Exception:
+            self._cube_truth_handle = None
+
+        # Only plate/door need a sim handle; the cube is perception-only.
         self._handles: dict[str, int | None] = {}
-        for t in _TARGETS:
+        for t in _SIM_TARGETS:
             try:
                 self._handles[t.name] = self.sim.getObject(t.sim_alias)
             except Exception:
@@ -141,6 +168,9 @@ class ColorDetectorNode(Node):
                 PoseStamped, f'/targets/{t.name}', latched)
             for t in _TARGETS
         }
+        # Live cube bearing for visual servoing (base_link, every frame).
+        self._cube_live_pub = self.create_publisher(
+            PoseStamped, '/targets/cube_live', 10)
         self._marker_pub = self.create_publisher(
             MarkerArray, '/targets/markers', latched)
         self._published: set[str] = set()
@@ -208,8 +238,6 @@ class ColorDetectorNode(Node):
     # ===== callbacks ====================================================
 
     def _on_image(self, msg: Image) -> None:
-        if len(self._published) == len(_TARGETS) and not self._pending:
-            return
         try:
             bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
@@ -217,15 +245,24 @@ class ColorDetectorNode(Node):
                                    throttle_duration_sec=2.0)
             return
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        img_h, img_w = hsv.shape[:2]
 
-        # Retry pending detections (TF may now be available).
+        # Cube: perception-only, tracked on every frame (no sim truth).
+        cube_det = self._detect(hsv, _CUBE)
+        if cube_det is not None:
+            self._publish_cube(cube_det, img_w, img_h)
+
+        if len(self._published) == len(_TARGETS) and not self._pending:
+            return
+
+        # Retry pending sim-truth detections (TF may now be available).
         for name in list(self._pending):
             t, det = self._pending[name]
             if self._try_publish(t, det):
                 del self._pending[name]
 
-        # Detect and publish new targets.
-        for t in _TARGETS:
+        # Detect and publish new sim-truth targets (plate, door).
+        for t in _SIM_TARGETS:
             if t.name in self._published or t.name in self._pending:
                 continue
             det = self._detect(hsv, t)
@@ -236,9 +273,9 @@ class ColorDetectorNode(Node):
     # ===== detection / publishing =======================================
 
     def _detect(self, hsv: np.ndarray, target: ColorTarget
-                ) -> tuple[float, float, int] | None:
+                ) -> tuple[float, float, int, int] | None:
         """Largest connected component matching the HSV windows.
-        Returns (centroid_x_px, centroid_y_px, largest_bbox_dim_px), or
+        Returns (centroid_x_px, centroid_y_px, bbox_w_px, bbox_h_px), or
         ``None`` if no blob clears ``target.min_pixels``."""
         mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
         for lo, hi in target.hsv_ranges:
@@ -252,12 +289,131 @@ class ColorDetectorNode(Node):
             return None
         cx = float(centroids[idx, 0])
         cy = float(centroids[idx, 1])
-        size_px = max(int(stats[idx, cv2.CC_STAT_WIDTH]),
-                      int(stats[idx, cv2.CC_STAT_HEIGHT]))
-        return cx, cy, size_px
+        w_px = int(stats[idx, cv2.CC_STAT_WIDTH])
+        h_px = int(stats[idx, cv2.CC_STAT_HEIGHT])
+        return cx, cy, w_px, h_px
+
+    # ===== cube perception (no sim ground truth) ========================
+
+    def _cube_point_camera(self, cx: float, cy: float, size_px: int,
+                           img_w: int, img_h: int
+                           ) -> tuple[float, float, float] | None:
+        """Cube centre in the ``camera_optical_link`` frame from the blob.
+
+        Pinhole back-projection of the centroid with monocular depth from
+        the known cube height: ``Z = f_pix * real_size / size_px`` (size_px
+        is the blob's vertical pixel extent). Optical convention: +x right,
+        +y down, +z forward.
+
+        Intrinsics are derived from the *actual published image* size (not
+        the sim sensor resolution, which may differ from what robomaster_ros
+        publishes) and the camera FOV. The principal point is the image
+        centre."""
+        if self._cam_fov is None or size_px <= 0:
+            return None
+        # CoppeliaSim's perspective_angle spans the longer image axis.
+        f_pix = max(img_w, img_h) / (2.0 * math.tan(self._cam_fov / 2.0))
+        z = (_CUBE.real_size_m * f_pix) / size_px
+        x = (cx - img_w / 2.0) / f_pix * z
+        y = (cy - img_h / 2.0) / f_pix * z
+        return float(x), float(y), float(z)
+
+    def _publish_cube(self, detection: tuple[float, float, int, int],
+                      img_w: int, img_h: int) -> None:
+        """Localise the cube from the camera and publish the live bearing
+        (base_link, every frame) plus a continuously-refined map pose.
+
+        The map pose is re-published as the robot approaches: a far first
+        sighting (a few pixels tall) gives a poor monocular range, which
+        sharpens as the cube grows in frame. Latching the first estimate
+        would freeze that early error, so it is refreshed instead."""
+        cx, cy, _w_px, h_px = detection
+        cam = self._cube_point_camera(cx, cy, h_px, img_w, img_h)
+        if cam is None:
+            return
+        ps = PointStamped()
+        ps.header.frame_id = _CAMERA_FRAME
+        ps.header.stamp = rclpy.time.Time().to_msg()  # latest available TF
+        ps.point.x, ps.point.y, ps.point.z = cam
+
+        # --- live bearing in base_link (for visual servoing) ------------
+        bl = self._transform_point(ps, _BASE_FRAME)
+        if bl is None:
+            self.get_logger().warn(
+                f"cube seen but TF '{_CAMERA_FRAME}'→'{_BASE_FRAME}' "
+                f"unavailable; is robot_state_publisher running?",
+                throttle_duration_sec=5.0)
+            return
+        self._cube_live_pub.publish(self._pose_from_point(bl, _BASE_FRAME))
+
+        # --- refined map pose (for the GO_TO_KEY Nav2 standoff) ---------
+        mp = self._transform_point(ps, self._map_frame)
+        if mp is None:
+            return
+        self._target_pubs['cube'].publish(
+            self._pose_from_point(mp, self._map_frame))
+        self._published.add('cube')
+        prev = self._marker_poses.get('cube')
+        cube_xyz = (mp.point.x, mp.point.y, mp.point.z)
+        if prev is None or math.hypot(
+                cube_xyz[0] - prev[0], cube_xyz[1] - prev[1]) > 0.05:
+            self._marker_poses['cube'] = cube_xyz
+            self._publish_markers()
+
+        self._log_cube_debug(detection, cam, bl, img_w, img_h)
+
+    def _log_cube_debug(self, detection, cam, bl,
+                        img_w: int, img_h: int) -> None:
+        """Throttled perception-vs-ground-truth check, in base_link so the
+        map↔world frame offset doesn't pollute the error. Diagnostic only,
+        never used for control."""
+        if self._cube_truth_handle is None or self._robot_handle is None:
+            return
+        try:
+            tw = self.sim.getObjectPosition(self._cube_truth_handle, -1)
+            r_pos = self.sim.getObjectPosition(self._robot_handle, -1)
+            r_yaw = _yaw_from_quat(
+                self.sim.getObjectQuaternion(self._robot_handle, -1))
+        except Exception:
+            return
+        # Ground-truth cube expressed in base_link (x fwd, y left).
+        dx, dy = tw[0] - r_pos[0], tw[1] - r_pos[1]
+        c, s = math.cos(-r_yaw), math.sin(-r_yaw)
+        tbx, tby = c * dx - s * dy, s * dx + c * dy
+        err = math.hypot(bl.point.x - tbx, bl.point.y - tby)
+        _, _, _w_px, h_px = detection
+        self.get_logger().info(
+            f'[cube dbg] img={img_w}x{img_h} simres={self._cam_res} '
+            f'fov={math.degrees(self._cam_fov or 0):.1f} h={h_px}px '
+            f'Z={cam[2]:.2f} '
+            f'base=({bl.point.x:.2f},{bl.point.y:.2f}) '
+            f'truth_base=({tbx:.2f},{tby:.2f}) err={err:.2f}m',
+            throttle_duration_sec=2.0)
+
+    def _transform_point(self, ps: PointStamped, frame: str
+                         ) -> PointStamped | None:
+        """Transform a PointStamped into ``frame`` via TF; None if the
+        transform is not (yet) available."""
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                frame, ps.header.frame_id, rclpy.time.Time())
+        except Exception:
+            return None
+        return do_transform_point(ps, tf)
+
+    @staticmethod
+    def _pose_from_point(p: PointStamped, frame: str) -> PoseStamped:
+        msg = PoseStamped()
+        msg.header = p.header
+        msg.header.frame_id = frame
+        msg.pose.position.x = p.point.x
+        msg.pose.position.y = p.point.y
+        msg.pose.position.z = p.point.z
+        msg.pose.orientation.w = 1.0
+        return msg
 
     def _try_publish(self, target: ColorTarget,
-                     detection: tuple[float, float, int]) -> bool:
+                     detection: tuple[float, float, int, int]) -> bool:
         """Localise target in map frame and publish. Returns False if TF
         is not yet available (caller should retry)."""
         if self._robot_handle is None:
@@ -315,11 +471,12 @@ class ColorDetectorNode(Node):
         return True
 
     def _estimate_world_xyz(self, target: ColorTarget,
-                            cx: float, cy: float, size_px: int
+                            cx: float, cy: float, w_px: int, h_px: int
                             ) -> tuple[float, float, float] | None:
         """Pinhole back-projection of the blob centroid plus monocular
         depth from the known target size:
         ``depth = f_pix * real_size / pixel_size``."""
+        size_px = max(w_px, h_px)
         if (self._camera_handle is None or self._cam_res is None
                 or self._cam_fov is None or size_px <= 0):
             return None

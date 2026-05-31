@@ -53,14 +53,14 @@ The project uses a Nav2 + slam_toolbox navigation stack:
 
 **Discovery**: A Lua script (`lidar_sensor.lua`) injected into the robot casts ground-truth rays and publishes `sensor_msgs/LaserScan` on `/scan`. `robomaster_ros` publishes wheel-encoder odometry on `/odom` and the `odom→base_link` TF. `slam_toolbox` builds a 2D occupancy map and provides `map→odom` localisation. `color_detector_node` finds coloured landmarks via HSV masking on the camera image, transforms each detection to the map frame via TF, and publishes latched `PoseStamped` on `/targets/{cube,plate,door}`.
 
-**Execution**: `explorer_node` sends `NavigateToPose` action goals to Nav2 for all navigation (exploration waypoints, go-to-key, go-to-plate, go-to-door). Short-range gripper manoeuvres (cube pickup alignment, plate drop alignment) still use direct `cmd_vel`. Gripper and cube attach/detach are driven via CoppeliaSim ZMQ.
+**Execution**: `explorer_node` sends `NavigateToPose` action goals to Nav2 for all navigation (exploration waypoints, go-to-key, go-to-plate, go-to-door). Short-range gripper manoeuvres still use direct `cmd_vel`: the cube pickup is **closed-loop visual servoing** on the live `/targets/cube_live` bearing (no ground-truth cube coordinate): it turns to centre the cube and approaches until ~0.9 m, where the monocular range (from the cube's pixel height) is still accurate, then commits to a straight **odometry-measured final approach** (the 0.20 m column's base clips out of the camera's bottom edge closer in, so the range can no longer be trusted) and closes the gripper. The plate drop aligns to the latched plate pose. Gripper and cube attach/detach are driven via CoppeliaSim ZMQ.
 
 ### ROS nodes (`src/escape_room/escape_room/nodes/`)
 
 | Node | Role |
 |---|---|
 | `lidar_sensor.lua` | Lua script injected into robot: ZMQ ray-caster → `/scan` (LaserScan, 10 Hz) |
-| `color_detector_node` | Camera → HSV → blob → sim-truth → TF → `PoseStamped` (map frame) on `/targets/{cube,plate,door}` |
+| `color_detector_node` | Camera → HSV → blob → `PoseStamped` (map frame) on `/targets/{cube,plate,door}`. **Cube** is localised by perception only (pinhole + monocular depth + `camera_optical_link` TF) and also streamed live in base_link on `/targets/cube_live` for the pickup; plate/door still use sim-truth |
 | `explorer_node` | Mission FSM: sends Nav2 `NavigateToPose` goals + gripper control via ZMQ |
 | `door_controller` | Polls CoppeliaSim via ZMQ, opens door when cube is on pressure plate |
 

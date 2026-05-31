@@ -30,10 +30,6 @@ from .explorer.nav_client import NavClient
 from .explorer.state import State
 
 
-def _wrap(a: float) -> float:
-    return math.atan2(math.sin(a), math.cos(a))
-
-
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -64,6 +60,10 @@ class ExplorerNode(Node):
                 lambda m, n=name: self._on_target(n, m),
                 latched,
             )
+        # Live cube bearing (base_link) for visual-servoing pickup.
+        self.create_subscription(
+            PoseStamped, "/targets/cube_live", self._on_cube_live, 10
+        )
         self.create_subscription(OccupancyGrid, "/map", self._on_map, latched)
 
         self.targets: dict[str, tuple[float, float]] = {}
@@ -71,6 +71,13 @@ class ExplorerNode(Node):
         self.action_t: float = 0.0
         self.current_map: OccupancyGrid | None = None
         self._started: bool = False
+        # Latest cube detection in base_link: (x_fwd, y_left, stamp_s).
+        self._cube_live: tuple[float, float, float] | None = None
+        # Odometry-measured final-approach ("lunge") state.
+        self._lunge_active: bool = False
+        self._lunge_start: tuple[float, float] | None = None
+        self._lunge_dist: float = 0.0
+        self._lunge_t0: float = 0.0
 
         self._handlers = {
             State.EXPLORE: self._explore,
@@ -94,17 +101,31 @@ class ExplorerNode(Node):
         p("cube_alias", "/TargetCube")
         p("map_frame", "map")
         p("base_frame", "base_link")
+        p("odom_frame", "odom")
         p("control_rate_hz", 4.0)
         p("door_threshold_inset_m", 0.20)
         p("exit_drive_speed_mps", 0.10)
         p("exit_drive_duration_s", 10.0)
-        p("pickup_standoff_m", 0.50)
+        p("pickup_standoff_m", 0.90)
         p("pickup_engage_dist_tol_m", 0.03)
         p("park_max_speed_mps", 0.06)
         p("align_yaw_tol_rad", 0.08)
         p("align_kp", 1.5)
         p("align_max_omega", 0.6)
         p("gripper_timeout_s", 4.0)
+        # Visual-servoing pickup (perception-only, no ground truth).
+        p("cube_live_timeout_s", 0.8)
+        p("pickup_search_omega", 0.3)
+        # Range at which we stop trusting the (height-based) monocular depth
+        # and commit to an odometry-measured straight final approach. The
+        # cube is a 0.20 m column; nearer than this its base clips out of the
+        # camera's bottom edge, shrinking its pixel height and inflating the
+        # estimated range — which would drive the robot through the cube.
+        p("pickup_lunge_start_m", 0.90)
+        # Stop the straight lunge this much short of the computed engage
+        # distance, so the gripper closes just before reaching the cube
+        # rather than nudging it forward.
+        p("pickup_lunge_margin_m", 0.05)
 
         def g(n):
             return self.get_parameter(n).value
@@ -113,6 +134,7 @@ class ExplorerNode(Node):
         self.cube_alias = g("cube_alias")
         self.map_frame = g("map_frame")
         self.base_frame = g("base_frame")
+        self.odom_frame = g("odom_frame")
         self.control_rate_hz = float(g("control_rate_hz"))
         self.door_threshold_inset = float(g("door_threshold_inset_m"))
         self.exit_drive_speed = float(g("exit_drive_speed_mps"))
@@ -124,6 +146,10 @@ class ExplorerNode(Node):
         self.align_kp = float(g("align_kp"))
         self.align_max_omega = float(g("align_max_omega"))
         self.gripper_timeout = float(g("gripper_timeout_s"))
+        self.cube_live_timeout = float(g("cube_live_timeout_s"))
+        self.pickup_search_omega = float(g("pickup_search_omega"))
+        self.pickup_lunge_start = float(g("pickup_lunge_start_m"))
+        self.pickup_lunge_margin = float(g("pickup_lunge_margin_m"))
 
     # ===== ROS callbacks =============================================
 
@@ -144,6 +170,14 @@ class ExplorerNode(Node):
                 f"saw '{name}' at ({x:.2f}, {y:.2f}) [{len(self.targets) + 1}/3]"
             )
         self.targets[name] = (x, y)
+
+    def _on_cube_live(self, msg: PoseStamped) -> None:
+        # Pose is in base_link: x forward, y left.
+        self._cube_live = (
+            msg.pose.position.x,
+            msg.pose.position.y,
+            self.clock_s(),
+        )
 
     # ===== FSM dispatcher ============================================
 
@@ -194,6 +228,8 @@ class ExplorerNode(Node):
             self._nav_go_to_key()
             return
         self.stop()
+        self._lunge_active = False
+        self._lunge_start = None
         self._transition(State.PICKUP_OPEN)
         self.action_t = self.clock_s()
         self.gripper.open()
@@ -250,54 +286,111 @@ class ExplorerNode(Node):
     # ===== align-phase tick methods ===================================
 
     def _pickup_align(self) -> None:
-        """P-controller: face cube, approach to pickup_engage_dist, then close."""
-        if self._align(
-            self.targets["cube"],
-            self.gripper.pickup_engage_dist,
-            self.pickup_engage_dist_tol,
-            State.PICKUP_CLOSE,
-        ):
-            self.action_t = self.clock_s()
-            self.gripper.close()
+        """Visual servoing onto the cube using perception only.
 
-    def _align(
-        self,
-        target_xy: tuple[float, float],
-        engage_dist: float,
-        dist_tol: float,
-        next_state: State,
-    ) -> bool:
-        """Shared P-controller. Returns True when transition to next_state fires."""
-        pose = self.get_robot_pose()
-        if pose is None:
-            return False
-        rx, ry, ryaw = pose
-        tx, ty = target_xy
-        dist = math.hypot(tx - rx, ty - ry)
-        target_yaw = math.atan2(ty - ry, tx - rx)
-        yaw_err = _wrap(target_yaw - ryaw)
+        Drives on the live ``/targets/cube_live`` bearing (base_link): turns
+        to centre the cube, then approaches. The monocular range (from the
+        cube's pixel height) is trustworthy only while the whole column is in
+        frame; closer than ``pickup_lunge_start`` its base clips out of the
+        bottom edge and the range balloons. So once centred and within that
+        range we commit to ``_pickup_lunge``: a straight, odometry-measured
+        final approach that ignores the (now unreliable) range. No
+        map/ground-truth cube coordinate is used."""
+        if self._lunge_active:
+            self._pickup_lunge()
+            return
 
-        if abs(yaw_err) > self.align_yaw_tol:
+        engage = self.gripper.pickup_engage_dist
+        now = self.clock_s()
+        fresh = (
+            self._cube_live is not None
+            and now - self._cube_live[2] <= self.cube_live_timeout
+        )
+        if not fresh:
+            # Lost / never acquired: rotate slowly to search.
+            twist = Twist()
+            twist.angular.z = self.pickup_search_omega
+            self.cmd_pub.publish(twist)
+            return
+
+        bx, by, _ = self._cube_live
+        rng = math.hypot(bx, by)
+        bearing = math.atan2(by, bx)
+
+        if abs(bearing) > self.align_yaw_tol:
             twist = Twist()
             twist.angular.z = _clamp(
-                self.align_kp * yaw_err, -self.align_max_omega, self.align_max_omega
+                self.align_kp * bearing,
+                -self.align_max_omega,
+                self.align_max_omega,
             )
             self.cmd_pub.publish(twist)
-            return False
+            return
 
-        dist_err = dist - engage_dist
-        if abs(dist_err) <= dist_tol:
+        # Centred and close enough: commit to the odometry-measured lunge.
+        if rng <= self.pickup_lunge_start:
+            pose = self.get_odom_pose()
+            if pose is None:
+                self.stop()
+                self.get_logger().warn("pickup: odom TF unavailable, waiting")
+                return
+            self._lunge_active = True
+            self._lunge_start = (pose[0], pose[1])
+            self._lunge_dist = max(0.0, rng - engage - self.pickup_lunge_margin)
+            self._lunge_t0 = now
             self.stop()
-            self._transition(next_state)
-            return True
+            self.get_logger().info(
+                f"pickup: committing to {self._lunge_dist:.2f} m straight "
+                f"approach (range {rng:.2f} m)")
+            return
 
+        # Approach forward while keeping centred.
         twist = Twist()
         twist.linear.x = _clamp(
-            0.5 * dist_err, -self.park_max_speed, self.park_max_speed
+            0.5 * (rng - engage), -self.park_max_speed, self.park_max_speed
         )
-        twist.angular.z = 0.5 * yaw_err
+        twist.angular.z = 0.5 * bearing
         self.cmd_pub.publish(twist)
-        return False
+
+    def _pickup_lunge(self) -> None:
+        """Straight, odometry-measured final approach to the cube.
+
+        Drives forward until the robot has advanced ``_lunge_dist`` (measured
+        in the smooth ``odom`` frame), then closes the gripper. While the cube
+        is still visible its bearing keeps steering the heading; for the last
+        few centimetres (cube below the camera FOV) it drives dead-straight.
+        A time-out guards against a stalled odom lookup."""
+        now = self.clock_s()
+        pose = self.get_odom_pose()
+        advanced = 0.0
+        if pose is not None and self._lunge_start is not None:
+            advanced = math.hypot(
+                pose[0] - self._lunge_start[0], pose[1] - self._lunge_start[1])
+        timeout = self._lunge_dist / max(self.park_max_speed, 1e-3) + 4.0
+
+        if advanced >= self._lunge_dist or now - self._lunge_t0 > timeout:
+            self.stop()
+            self._lunge_active = False
+            self._engage_cube()
+            return
+
+        twist = Twist()
+        twist.linear.x = self.park_max_speed
+        if (self._cube_live is not None
+                and now - self._cube_live[2] <= self.cube_live_timeout):
+            bx, by, _ = self._cube_live
+            twist.angular.z = _clamp(
+                0.5 * math.atan2(by, bx),
+                -self.align_max_omega,
+                self.align_max_omega,
+            )
+        self.cmd_pub.publish(twist)
+
+    def _engage_cube(self) -> None:
+        """Close the gripper on the cube and advance the FSM."""
+        self._transition(State.PICKUP_CLOSE)
+        self.action_t = self.clock_s()
+        self.gripper.close()
 
     # ===== timed-drive tick methods ===================================
 
@@ -402,6 +495,18 @@ class ExplorerNode(Node):
         q = tf.transform.rotation
         yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y**2 + q.z**2))
         return float(x), float(y), float(yaw)
+
+    def get_odom_pose(self) -> tuple[float, float] | None:
+        """Robot position in the odom frame (smooth, no SLAM jumps) — used to
+        measure short open-loop advances during the pickup lunge."""
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                self.odom_frame, self.base_frame, Time(),
+                timeout=Duration(seconds=0.1)
+            )
+        except Exception:
+            return None
+        return float(tf.transform.translation.x), float(tf.transform.translation.y)
 
     def clock_s(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9

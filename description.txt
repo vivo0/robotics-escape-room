@@ -1,0 +1,25 @@
+Group [X] - Escape Room: Autonomous Mapping and Grasping
+
+Students: Gianluca Viviano, Sara Mashhadi Alizadeh, Etienne Orio
+
+Problem
+A mobile robot is placed in an unknown room containing a coloured cylinder, a pressure plate, and a locked door. To escape, the robot must explore the room on its own, find the cylinder, pick it up, place it on the plate to unlock the door, and drive out. The key challenge is doing this without any ground-truth information from the simulator: the robot has to rely only on what its own sensors can perceive, so it must build its own understanding of the environment and locate the objects of interest visually.
+
+Approach (incremental)
+
+1. Scripted run with known positions. As a starting point, drive the robot through the room using fixed positions taken from the scenario. This is a trivial baseline that lets us verify the full sequence - moving, grasping, placing, and exiting - works end to end before adding any autonomy.
+
+2. Autonomous mapping. Remove the fixed positions for navigation and let the robot explore the room by itself, incrementally building a map of the walls and obstacles. At this stage the robot understands the geometry of the room but does not yet reason about the objects inside it.
+
+3. Visual localisation of objects. Add perception so the robot can recognise the cylinder, the plate, and the door from the camera, and estimate where they are within the map it built. Navigation goals are now derived from what the robot actually sees, not from prior knowledge.
+
+4. Grasping and full mission. Combine mapping and perception into the complete escape behaviour: approach the cylinder using only visual cues, grasp it reliably, carry it to the plate, and proceed through the door once it opens.
+
+Tools
+- ROS 2 for the overall software stack
+- A SLAM package for mapping and a navigation stack for path planning and obstacle avoidance
+- A computer-vision library for detecting the coloured objects
+- CoppeliaSim as the simulation environment
+
+Robot
+DJI RoboMaster EP, used in simulation, with the option of a demo on the physical robot if time allows.
