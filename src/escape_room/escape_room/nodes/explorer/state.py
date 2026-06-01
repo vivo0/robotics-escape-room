@@ -13,8 +13,6 @@ class State(Enum):
     DROP_ALIGN = "drop_align"
     DROP_OPEN = "drop_open"
     DROP_BACKUP = "drop_backup"
-    GO_TO_DOOR = "go_to_door"
-    EXIT_DRIVE = "exit_drive"
     DONE = "done"
 
     def __str__(self) -> str:

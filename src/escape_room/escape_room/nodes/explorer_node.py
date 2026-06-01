@@ -4,8 +4,9 @@
 Each state is one tick-method; the robot walks through them in order:
     EXPLORE -> GO_TO_KEY
             -> PICKUP_OPEN -> PICKUP_ALIGN -> PICKUP_CLOSE
-            -> GO_TO_PLATE -> DROP_ALIGN -> DROP_OPEN -> DROP_BACKUP
-            -> GO_TO_DOOR -> EXIT_DRIVE -> DONE
+            -> GO_TO_PLATE -> DROP_ALIGN -> DROP_OPEN -> DROP_BACKUP -> DONE
+The mission ends once the key is on the pressure plate (which opens the
+door); the robot itself never drives to the door.
 Nav2 does the long-range driving; cmd_vel does the short precise moves.
 """
 
@@ -87,14 +88,12 @@ class ExplorerNode(Node):
             State.EXPLORE: self._explore,
             State.GO_TO_KEY: self._go_to_key,
             State.GO_TO_PLATE: self._go_to_plate,
-            State.GO_TO_DOOR: self._go_to_door,
             State.PICKUP_OPEN: self._pickup_open,
             State.PICKUP_ALIGN: self._pickup_align,
             State.PICKUP_CLOSE: self._pickup_close,
             State.DROP_ALIGN: self._drop_align,
             State.DROP_OPEN: self._drop_open,
             State.DROP_BACKUP: self._drop_backup,
-            State.EXIT_DRIVE: self._exit_drive,
             State.DONE: self._done,
         }
 
@@ -110,9 +109,6 @@ class ExplorerNode(Node):
         p("base_frame", "base_link")
         p("odom_frame", "odom")
         p("control_rate_hz", 4.0)
-        p("door_threshold_inset_m", 0.20)
-        p("exit_drive_speed_mps", 0.10)
-        p("exit_drive_duration_s", 10.0)
         p("pickup_standoff_m", 0.90)
         p("park_max_speed_mps", 0.06)
         p("align_yaw_tol_rad", 0.08)
@@ -146,9 +142,6 @@ class ExplorerNode(Node):
         self.base_frame = g("base_frame")
         self.odom_frame = g("odom_frame")
         self.control_rate_hz = float(g("control_rate_hz"))
-        self.door_threshold_inset = float(g("door_threshold_inset_m"))
-        self.exit_drive_speed = float(g("exit_drive_speed_mps"))
-        self.exit_drive_duration = float(g("exit_drive_duration_s"))
         self.pickup_standoff = float(g("pickup_standoff_m"))
         self.park_max_speed = float(g("park_max_speed_mps"))
         self.align_yaw_tol = float(g("align_yaw_tol_rad"))
@@ -263,16 +256,6 @@ class ExplorerNode(Node):
         self.stop()
         self._transition(State.DROP_ALIGN)   # Nav2 got us close; align precisely
 
-    def _go_to_door(self) -> None:
-        if self.nav.active:
-            return
-        if not self.nav.succeeded:
-            self.get_logger().warn("go_to_door nav failed; retrying")
-            self._nav_go_to_door()
-            return
-        self._transition(State.EXIT_DRIVE)
-        self.action_t = self.clock_s()
-
     def _done(self) -> None:
         pass
 
@@ -346,8 +329,9 @@ class ExplorerNode(Node):
             pose[0] - self._backup_start[0], pose[1] - self._backup_start[1])
         if advanced >= self.drop_backup_dist:
             self.stop()
-            self._transition(State.GO_TO_DOOR)
-            self._nav_go_to_door()
+            # key is on the plate and the door opens: mission complete
+            self._transition(State.DONE)
+            self.get_logger().info("mission complete")
             return
         self._drive(-self.park_max_speed, 0.0, cap_linear=False)  # straight back
 
@@ -430,19 +414,6 @@ class ExplorerNode(Node):
         self.action_t = self.clock_s()
         self.gripper.close()
 
-    # ===== timed-drive tick methods ===================================
-
-    def _exit_drive(self) -> None:
-        # just drive forward through the open door for a fixed time, then done
-        if self.clock_s() - self.action_t >= self.exit_drive_duration:
-            self.stop()
-            self._transition(State.DONE)
-            self.get_logger().info("mission complete")
-            return
-        twist = Twist()
-        twist.linear.x = self.exit_drive_speed
-        self.cmd_pub.publish(twist)
-
     # ===== state transition + nav goal helpers =======================
 
     def _transition(self, state: State) -> None:
@@ -474,49 +445,7 @@ class ExplorerNode(Node):
         self.publish_nav_goal(px, py, yaw)
         self.nav.send(px, py, yaw)
 
-    def _nav_go_to_door(self) -> None:
-        dx, dy = self.targets["door"]
-        nx, ny = self._door_outward_normal(dx, dy)   # which way is "out"
-        # aim just inside the doorway, pointing outward, then EXIT_DRIVE pushes through
-        tx = dx - self.door_threshold_inset * nx
-        ty = dy - self.door_threshold_inset * ny
-        yaw = math.atan2(ny, nx)
-        self.get_logger().info(
-            f"door threshold=({tx:.2f}, {ty:.2f}, yaw={math.degrees(yaw):+.0f}°)"
-        )
-        self.publish_nav_goal(tx, ty, yaw)
-        self.nav.send(tx, ty, yaw)
-
     # ===== shared helpers ============================================
-
-    def _door_outward_normal(self, dx: float, dy: float) -> tuple[float, float]:
-        # Which side of the door is "outside"? SLAM never maps outside the
-        # room, so those cells stay unknown (-1). Look a few cells past the
-        # door in each cardinal direction; the one with the most unknown
-        # cells points outward.
-        info = self.current_map.info
-        res = info.resolution
-        ox = info.origin.position.x
-        oy = info.origin.position.y
-        w, h = info.width, info.height
-        data = self.current_map.data
-        cx = int((dx - ox) / res)        # door position as grid cell
-        cy = int((dy - oy) / res)
-
-        def unknown_count(step_x: int, step_y: int, steps: int = 6) -> int:
-            # count unknown/off-map cells walking outward from the door
-            count = 0
-            for i in range(2, steps + 2):
-                gx, gy = cx + step_x * i, cy + step_y * i
-                if gx < 0 or gy < 0 or gx >= w or gy >= h:
-                    count += 1
-                elif data[gy * w + gx] < 0:      # -1 = unknown in the grid
-                    count += 1
-            return count
-
-        candidates = [(1, 0), (-1, 0), (0, 1), (0, -1)]
-        nx, ny = max(candidates, key=lambda d: unknown_count(d[0], d[1]))
-        return float(nx), float(ny)
 
     def stop(self) -> None:
         self.cmd_pub.publish(Twist())     # empty Twist = zero velocity
