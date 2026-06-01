@@ -83,7 +83,7 @@ the target poses and the occupancy map, drives long-range
 navigation by sending \texttt{NavigateToPose} goals to Nav2,
 and takes direct \texttt{cmd\_vel} control for the short-range
 pickup and drop manoeuvres.
-s
+
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=\columnwidth]{fig_architecture.png}}
 \caption{Node graph. White boxes: our components. Grey: third-party packages.
@@ -224,9 +224,7 @@ RPP was preferred over the DWB controller because it has fewer
 parameters to tune and produces smooth, predictable trajectories at
 the low speeds dictated by the small room.
 A separate \emph{goal checker} with a 0.25~m position tolerance
-determines when the \texttt{NavigateToPose} action reports success;
-this tolerance is large enough for navigation to waypoints but too
-loose for precision placement (see Section~\ref{sec:mission}).
+determines when the \texttt{NavigateToPose} action reports success.
 The local costmap is a 2$\times$2~m rolling window with 0.35~m
 inflation around obstacles.
 The global costmap covers the full map.
@@ -346,12 +344,10 @@ pressure plate. The robot is backing away before turning.}
 \label{fig:stage_drop}
 \end{figure}
 
-Nav2's 0.25~m goal-checker tolerance is too coarse for a 0.3~m plate.
-
 \textbf{DROP\_ALIGN}: the controller switches to direct \texttt{cmd\_vel}.
 Proportional control on yaw error faces the robot toward the plate,
-then drives it forward until the cube's estimated position ---
-$d_\mathrm{carried} = 0.207$~m ahead of \texttt{base\_link} ---
+then drives it forward until the cube's estimated position
+($d_\mathrm{carried} = 0.207$~m ahead of \texttt{base\_link})
 is within 0.03~m of the plate centre.
 
 \textbf{DROP\_OPEN}: the gripper opens and the cube's lidar visibility
@@ -382,22 +378,17 @@ recovery behaviours) but gave us a much more reliable system.
 
 \subsection{Lidar: Python node to Lua script}
 
-The first lidar was a Python ROS~2 node that asked the simulator for
-distances to each obstacle one by one.
-This was slow and depended on knowing the object list in advance.
+The first lidar was a Python ROS~2 node that queried the simulator
+for the distance to each object individually.
+Because it had no access to actual object geometry, it approximated
+every shape as an axis-aligned bounding box (AABB): cylinders
+appeared as squares on the occupancy map, which confused Nav2's
+costmap and planner.
 We replaced it with a Lua script running inside the simulator that
-rotates a native ray sensor and reads distances directly.
-This is much faster and works for any scene.
-
-\subsection{Colour detector: fixing the coordinate transform}
-
-The first version of the colour detector estimated positions in the
-robot's local frame using a manual rotation based on the starting
-heading.
-This broke as soon as the robot turned.
-We rewrote it to use the full TF tree, transforming each detection
-from the camera frame to the map frame.
-This works at any robot pose.
+rotates a native ray sensor and reads hit distances directly from
+the physics engine.
+The ray sensor sees actual geometry, so cylinders map as circles
+and any scene works without knowing the object list in advance.
 
 \subsection{Loop closure jumping}
 
@@ -425,29 +416,19 @@ We added the odometry lunge to handle this last stretch, where
 odometry is accurate enough for the short straight-line distance
 involved.
 
-\subsection{CoppeliaSim Euler angle bug}
-
-When setting object orientations using Euler angles, CoppeliaSim
-silently reorders the angles in some cases (swapping roll and yaw),
-so the robot spawned facing the wrong direction.
-We fixed this by using the rotation matrix API instead, which has
-no ambiguity.
-
 \subsection{Gripper: friction-only hold}
 
-The stock RoboMaster gripper script in CoppeliaSim calls
-\texttt{sim.setObjectParent} to reparent any grasped object as a
-child of the gripper's attach point.
-With reparenting, the cube's orientation is locked to the gripper:
-any yaw rotation during driving would tilt the cube and cause it to
-miss the plate on release.
-We blocked \texttt{setObjectParent} entirely by overriding it with a
-no-op in a Lua shim that the scene builder injects into the gripper
-script, and instead rely on friction contact alone to hold the cube.
-To make this reliable we raised the friction coefficient to 1.0 on
-the gripper finger shapes and the cube (across all supported physics
-engines) and added linear and angular damping to the cube so it
-does not bounce or spin when first squeezed.
+The stock gripper script calls \texttt{sim.setObjectParent} to attach
+the grasped object rigidly to the gripper's scene-graph node, which
+means the cube's orientation is locked to the gripper and any rotation
+during driving would tilt it off the plate on release.
+The scene builder comments out that call directly in the gripper
+script source before the simulation starts, so the cube is held
+purely by contact forces instead.
+To make friction-only holding reliable we raised the friction
+coefficient to 1.0 on the gripper fingers and the cube across all
+supported physics engines, and added linear and angular damping to
+the cube to prevent bouncing or spinning when the gripper closes.
 
 \subsection{Removing the GO\_TO\_DOOR state}
 
