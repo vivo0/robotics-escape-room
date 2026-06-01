@@ -5,7 +5,6 @@
 \usepackage{graphicx}
 \usepackage{textcomp}
 \usepackage{xcolor}
-\usepackage{placeins}
 \def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
     T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
 \begin{document}
@@ -29,7 +28,7 @@ a lidar sensor script injected into the simulator, a colour-based
 landmark detector using monocular depth estimation, and a nine-state
 mission controller that combines Nav2 path planning with
 visual servoing for the pickup.
-The robot completes the full task from start to finish.
+The robot reliably completes all tested scenarios from start to finish.
 \end{abstract}
 
 
@@ -68,25 +67,29 @@ Section~\ref{sec:conclusion} concludes.
 \section{System Architecture}
 \label{sec:arch}
 
-\subsection{Simulator--ROS bridge}
-
-CoppeliaSim provides a remote API over ZMQ.
-We use it in three places: (1) a scene-building script that constructs
-the room from a JSON file at startup; (2) the colour detector reads the
-camera field-of-view angle once at startup for the depth calculation;
-(3) the mission controller opens and closes the gripper and hides or
-shows the cube to the lidar as needed.
-
 \subsection{Node graph and data flow}
 
+Fig.~\ref{fig:arch} shows the data flow between all nodes.
+The system has two custom ROS~2 nodes on top of the standard
+Nav2 and \texttt{slam\_toolbox} stacks.
+\texttt{color\_detector\_node} subscribes to the raw camera image,
+runs the HSV pipeline, and publishes a latched
+\texttt{PoseStamped} for each detected landmark on
+\texttt{/targets/\{cube,plate,door\}}; it also streams the live
+cube bearing on \texttt{/targets/cube\_live} at every frame for
+the visual-servo phase.
+\texttt{explorer\_node} is the mission FSM: it subscribes to
+the target poses and the occupancy map, drives long-range
+navigation by sending \texttt{NavigateToPose} goals to Nav2,
+and takes direct \texttt{cmd\_vel} control for the short-range
+pickup and drop manoeuvres.
+s
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=\columnwidth]{fig_architecture.png}}
 \caption{Node graph. White boxes: our components. Grey: third-party packages.
 Arrows show the main ROS~2 topics and actions between nodes.}
 \label{fig:arch}
 \end{figure}
-
-Fig.~\ref{fig:arch} shows the data flow between all nodes.
 
 \subsection{Scenario configuration}
 
@@ -99,23 +102,29 @@ The scene builder connects to CoppeliaSim, removes any previous
 objects, and builds the room from scratch.
 This means changing the scenario only requires swapping the JSON file,
 no code changes are needed.
-Two scenarios are included: \texttt{easy.json} (5$\times$4~m room,
-three obstacles) and \texttt{medium.json} (same room, four obstacles
-with a wall-length divider, offset door, and different robot start).
+Three scenarios are included: \texttt{easy.json} (5$\times$4~m room,
+three obstacles), \texttt{medium.json} (same room, four obstacles
+with a wall-length divider, offset door, and different robot start),
+and \texttt{hard.json} (increased obstacle density and a more
+constrained layout).
 The colours in the JSON must match the HSV thresholds in the
 colour detector.
 
-\subsection{Coordinate frames}
+\subsection{Simulator--ROS bridge}
 
-The TF tree is:
-\texttt{map\,$\to$\,odom\,$\to$\,base\_link\,$\to$\,laser\_link}.
-\texttt{slam\_toolbox} provides \texttt{map\,$\to$\,odom};
-\texttt{robomaster\_ros} provides \texttt{odom\,$\to$\,base\_link};
-a static publisher provides \texttt{base\_link\,$\to$\,laser\_link}
-at $z = 0.12$~m.
-The camera frame \texttt{camera\_optical\_link} is also published
-by \texttt{robomaster\_ros} and is used by the colour detector to
-convert pixel detections to 3D positions.
+CoppeliaSim exposes a ZMQ-based remote API that lets external programs
+call simulator functions as Python method calls at runtime, without
+any shared memory or special ROS bridge.
+We use it in three places.
+A scene-building script (\texttt{build\_scene.py}) uses the API to
+build the room from the scenario file at startup.
+The colour detector reads the camera field-of-view angle once at
+startup to compute the focal length for depth estimation.
+The mission controller opens and closes the gripper, and toggles
+the cube's \emph{detectable} flag to hide it from the lidar while it
+is being carried, preventing Nav2 from mapping the held cube as a
+wall directly in front of the robot.
+
 
 % =====================================================================
 \section{Perception}
@@ -126,9 +135,9 @@ convert pixel detections to 3D positions.
 CoppeliaSim does not publish laser scans for ROS~2 by default.
 We wrote a Lua script that is injected into the simulator at startup
 and attached to the robot.
-Each cycle (10~Hz) the script rotates a ray sensor to each of
-$N = 360$ angles $\theta_i = -\pi + i\,(2\pi/N)$, reads the hit
-distance, and publishes the result as a laser scan.
+Each cycle (10~Hz) the script rotates a ray sensor through 360
+uniformly spaced angles, reads the hit distance, and publishes
+the result as a laser scan.
 The robot body is made invisible to the ray sensor so that rays
 pass through the chassis and only hit walls and obstacles.
 
@@ -157,52 +166,26 @@ the object's position.}
 
 The cube and door are upright objects with known real heights
 (0.20~m and 0.50~m).
-Using the pinhole camera model, if an object of real height $H$
-appears as $h_{\mathrm{px}}$ pixels tall in the image, its depth is:
-
-\begin{equation}
-  z = \frac{f \cdot H}{h_{\mathrm{px}}},
-  \label{eq:mono}
-\end{equation}
-
-where $f$ is the focal length in pixels, computed from the camera
-field-of-view angle $\alpha$:
-$f = (w/2) / \tan(\alpha/2)$.
-The centroid pixel $(c_x, c_y)$ is then converted to a 3D point in
-the camera frame:
-
-\begin{equation}
-  \mathbf{p}_{\mathrm{cam}} =
-  \Bigl(\tfrac{c_x - w/2}{f}\,z,\;\tfrac{c_y - h/2}{f}\,z,\;z\Bigr),
-\end{equation}
-
-and transformed to the map frame using the TF tree.
-Frames where the blob touches the image edge are skipped because
-the pixel height would be cut off and the depth would be wrong.
+The pinhole camera model gives depth directly from the blob's pixel
+height: an object that is $H$ metres tall and appears $h_\mathrm{px}$
+pixels tall is at depth $z = f H / h_\mathrm{px}$, where $f$ is the
+focal length derived from the camera's field-of-view angle read from
+the simulator at startup.
+The blob centroid is then back-projected to that depth in the camera
+frame and transformed into the map frame via the TF tree.
+Frames where the blob touches the image edge are skipped because the
+visible pixel height is cut off and would give a wrong depth.
 
 \subsubsection{Floor-ray intersection (pressure plate)}
 
-The plate is flat on the floor, so measuring its pixel height does
-not give a useful depth.
-Instead, we shoot a ray through the centroid pixel, transform both
-the ray origin and direction to the map frame, and find where the ray
-crosses the floor plane ($z = 0$):
+The plate is flat on the floor, so its pixel height gives no useful
+depth.
+Instead, we cast a ray through the centroid pixel, transform the ray
+into the map frame, and intersect it with the floor plane ($z = 0$)
+to recover the plate's $(x, y)$ position.
+This approach works regardless of the plate's size and requires no
+knowledge of the plate dimensions.
 
-\begin{equation}
-  s = \frac{-o_z}{p_z - o_z}, \quad
-  (x,y) = (o_x + s\,(p_x - o_x),\; o_y + s\,(p_y - o_y)),
-\end{equation}
-
-where $\mathbf{o}$ is the camera origin and $\mathbf{p}$ is a point
-one unit along the ray, both in the map frame.
-This works regardless of the plate's size.
-
-\subsubsection{Live cube position for the pickup}
-
-The cube position in the robot frame (\texttt{base\_link}) is also
-published every frame on a separate topic.
-The pickup controller uses this to always have a fresh direction
-towards the cube.
 
 % =====================================================================
 \section{Navigation and Mapping}
@@ -210,14 +193,17 @@ towards the cube.
 
 \subsection{SLAM}
 
-\texttt{slam\_toolbox} runs in online mode and
-builds a 2D occupancy map at 5~cm per cell from the lidar scan and
-odometry.
-We disabled loop closure because in a small 5$\times$4~m room it
-caused sudden jumps in the map transform when the robot passed through
-the same area twice.
-Those jumps caused Nav2 to abort its current goal.
-Without loop closure, the map is accurate enough for the task.
+\texttt{slam\_toolbox} runs in online mapping mode and builds a 2D
+occupancy map at 5~cm per cell from the lidar scan and odometry.
+Scan matching aligns each new scan against the current map, correcting
+the accumulated wheel-slip drift that raw odometry alone cannot
+account for on the RoboMaster's mecanum drive.
+We disabled loop closure because in this small room it caused
+sudden jumps of 0.3--0.5~m in the \texttt{map}$\to$\texttt{odom}
+transform when the robot revisited a mapped area, which caused Nav2 to
+abort its current goal mid-path.
+Without loop closure the drift over one exploration pass is small
+enough (sub-cell) to complete the task reliably.
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=\columnwidth]{fig_map.png}}
@@ -230,28 +216,40 @@ unexplored. The planned path from Nav2 is shown in green.}
 \subsection{Nav2}
 
 Nav2 handles all long-range path planning and following.
-We use the NavFn planner (Dijkstra) with a 0.5~m goal tolerance and
-the Regulated Pure Pursuit controller at 0.15~m/s.
+We use the NavFn planner (Dijkstra) with a 0.5~m \emph{planner}
+tolerance (the maximum distance between the computed path endpoint
+and the requested goal), and the Regulated Pure Pursuit (RPP)
+controller at a target speed of 0.15~m/s.
+RPP was preferred over the DWB controller because it has fewer
+parameters to tune and produces smooth, predictable trajectories at
+the low speeds dictated by the small room.
+A separate \emph{goal checker} with a 0.25~m position tolerance
+determines when the \texttt{NavigateToPose} action reports success;
+this tolerance is large enough for navigation to waypoints but too
+loose for precision placement (see Section~\ref{sec:mission}).
 The local costmap is a 2$\times$2~m rolling window with 0.35~m
 inflation around obstacles.
 The global costmap covers the full map.
 
 \subsection{Frontier exploration}
 
-To explore the room the robot uses frontier-based
-exploration.
-A frontier cell is a free cell (map value 0) that has at least one
+To explore the room the robot uses frontier-based exploration.
+A frontier cell is a free cell (map value 0) with at least one
 unknown neighbour (map value $-1$).
-Adjacent frontier cells are grouped into clusters using BFS;
-clusters with fewer than 20 cells are ignored.
-The robot always drives to the closest cluster centre.
-Exploration stops once all three landmarks have been seen.
+Adjacent frontier cells are grouped into clusters by BFS;
+clusters with fewer than 20 cells are discarded as noise.
+Each tick the robot sends a \texttt{NavigateToPose} goal to Nav2 for
+the closest cluster centre, so the same planner and controller handle
+both exploration driving and task navigation.
+Exploration stops once all three landmarks have been detected; at
+that point the FSM cancels any active Nav2 goal and transitions to
+\textbf{GO\_TO\_KEY}.
 
 % =====================================================================
 \section{Mission Execution}
 \label{sec:mission}
 
-\subsection{State machine}
+\subsection{State machine overview}
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=\columnwidth]{fig_fsm.png}}
@@ -260,23 +258,30 @@ white states use direct velocity commands.}
 \label{fig:fsm}
 \end{figure}
 
-The mission controller (Fig.~\ref{fig:fsm}) runs as a state machine
-at 4~Hz.
-It waits at startup until Nav2, the map, and the robot position are
-all available, then runs through nine states:
-\textbf{EXPLORE} $\to$ \textbf{GO\_TO\_KEY} $\to$
-\textbf{PICKUP\_OPEN} $\to$ \textbf{PICKUP\_ALIGN} $\to$
-\textbf{PICKUP\_CLOSE} $\to$ \textbf{GO\_TO\_PLATE} $\to$
-\textbf{DROP\_ALIGN} $\to$ \textbf{DROP\_OPEN} $\to$
-\textbf{DROP\_BACKUP} $\to$ \textbf{DONE}.
+The mission controller (Fig.~\ref{fig:fsm}) runs as a timer callback
+at 4~Hz. It waits at startup until Nav2, the occupancy map, and the
+robot's position in the map frame are all available, then advances
+through ten states:
+\begin{enumerate}
+  \item \textbf{EXPLORE}
+  \item \textbf{GO\_TO\_KEY}
+  \item \textbf{PICKUP\_OPEN}
+  \item \textbf{PICKUP\_ALIGN}
+  \item \textbf{PICKUP\_CLOSE}
+  \item \textbf{GO\_TO\_PLATE}
+  \item \textbf{DROP\_ALIGN}
+  \item \textbf{DROP\_OPEN}
+  \item \textbf{DROP\_BACKUP}
+  \item \textbf{DONE}
+\end{enumerate}
 
-\subsection{Navigation states}
+\subsection{Exploration and navigation to key}
 
-\textbf{GO\_TO\_KEY} sends a Nav2 goal to a point 0.9~m in front of
-the cube, facing it.
-\textbf{GO\_TO\_PLATE} sends a goal to the plate position.
-If Nav2 fails (for example, a partial plan near a wall), the goal
-is retried automatically.
+\textbf{EXPLORE}: the robot sends \texttt{NavigateToPose} goals to
+the nearest frontier cluster centroid (Section~\ref{sec:nav}).
+Each time a landmark is detected by the colour detector its pose is
+stored; the state ends as soon as all three landmarks (cube, plate,
+door) have been seen at least once and their poses are known.
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=\columnwidth]{fig_stage_explore.png}}
@@ -286,28 +291,37 @@ costmap are visible in RViz.}
 \label{fig:stage_explore}
 \end{figure}
 
-\FloatBarrier
-\subsection{Pickup (PICKUP\_ALIGN)}
+\textbf{GO\_TO\_KEY}: Nav2 drives the robot to a standoff point 0.9~m
+in front of the cube, oriented to face it.
+Stopping 0.9~m away gives the visual-servo phase enough working range
+before the cylinder base leaves the camera's field of view.
+If Nav2 reports failure the goal is retried automatically.
 
-The pickup works in two steps.
-First, the robot uses the live cube position from the camera:
-it turns to face the cube and drives forward while keeping it centred
-(proportional control on the yaw error).
+\subsection{Pickup sequence}
 
-At about 0.9~m from the cube, the bottom of the 0.20~m cylinder
-moves below the camera's field of view.
-At that point the pixel height $h_\mathrm{px}$ in~\eqref{eq:mono}
-becomes wrong, so the depth estimate is no longer reliable.
-The robot therefore switches to an \emph{odometry lunge}: it drives
-straight ahead by a fixed distance measured from the odometry, not
-from SLAM (the SLAM map transform can jump, while odometry is smooth
-over short distances).
-The lunge distance is:
+\textbf{PICKUP\_OPEN}: commands the gripper to open fully and waits
+for confirmation before advancing.
+
+\textbf{PICKUP\_ALIGN}: the most complex state.
+The robot uses the live cube bearing from \texttt{/targets/cube\_live}:
+a proportional controller on yaw error turns the robot to keep the
+cube centred in the image while driving forward.
+At about 0.9~m the base of the 0.20~m cylinder moves below the
+camera's lower edge, making the pixel-height depth estimate
+unreliable.
+The robot freezes the last valid range reading and switches to an
+\emph{odometry lunge}: it drives straight ahead by
 $d_\mathrm{lunge} = r - d_\mathrm{engage} - d_\mathrm{margin}$,
-where $r = 0.9$~m is the frozen range, $d_\mathrm{engage} = 0.177$~m
-is the gripper reach, and $d_\mathrm{margin} = 0.03$~m avoids
-tipping the thin cylinder.
-The gripper then closes.
+where $r = 0.9$~m, $d_\mathrm{engage} = 0.177$~m is the gripper
+reach, and $d_\mathrm{margin} = 0.03$~m avoids tipping the cylinder.
+Odometry is used instead of the SLAM transform because short
+straight-line odometry is smooth and accurate, whereas the
+\texttt{map}$\to$\texttt{odom} transform can jump.
+
+\textbf{PICKUP\_CLOSE}: closes the gripper and waits for confirmation.
+The cube is then hidden from the lidar
+(\texttt{objectspecialproperty\_detectable\_all = 0}) so that Nav2
+does not see the carried object as a wall in front of the robot.
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=\columnwidth]{fig_stage_pickup.png}}
@@ -317,11 +331,13 @@ cube centred in the frame just before the odometry lunge.}
 \label{fig:stage_pickup}
 \end{figure}
 
-While the cube is being carried, it is hidden from the lidar so that
-Nav2 does not see it as a wall in front of the robot.
+\subsection{Drop sequence}
 
-\FloatBarrier
-\subsection{Drop (DROP\_ALIGN, DROP\_OPEN, DROP\_BACKUP)}
+\textbf{GO\_TO\_PLATE}: Nav2 drives the robot to the plate position
+stored during exploration.
+The same retry logic as GO\_TO\_KEY applies.
+Because the plate is flat on the floor and does not obstruct the
+lidar, Nav2 can plan and drive directly to it.
 
 \begin{figure}[htbp]
 \centerline{\includegraphics[width=\columnwidth]{fig_stage_drop.png}}
@@ -330,17 +346,25 @@ pressure plate. The robot is backing away before turning.}
 \label{fig:stage_drop}
 \end{figure}
 
-Nav2's position tolerance of 0.25~m is too large for a 0.3~m plate.
-After arriving near the plate, the robot switches to direct velocity
-control for the final alignment: it faces the plate and drives until
-the cube's estimated position (gripper reach ahead of the robot)
-matches the plate centre, within 0.03~m.
-The gripper then opens and the cube becomes visible to the lidar again.
-Finally the robot reverses 0.25~m in a straight line before turning,
-so that the gripper does not push the cube off the plate.
+Nav2's 0.25~m goal-checker tolerance is too coarse for a 0.3~m plate.
+
+\textbf{DROP\_ALIGN}: the controller switches to direct \texttt{cmd\_vel}.
+Proportional control on yaw error faces the robot toward the plate,
+then drives it forward until the cube's estimated position ---
+$d_\mathrm{carried} = 0.207$~m ahead of \texttt{base\_link} ---
+is within 0.03~m of the plate centre.
+
+\textbf{DROP\_OPEN}: the gripper opens and the cube's lidar visibility
+is restored so the map reflects its new position on the plate.
+
+\textbf{DROP\_BACKUP}: the robot reverses 0.25~m in a straight line
+measured by odometry before allowing any turning.
+Turning with an open gripper would sweep the cube off the plate.
+
+\textbf{DONE}: the mission controller stops issuing commands and the
+robot remains stationary.
 
 % =====================================================================
-\FloatBarrier
 \section{Engineering Challenges}
 \label{sec:challenges}
 
@@ -409,14 +433,50 @@ so the robot spawned facing the wrong direction.
 We fixed this by using the rotation matrix API instead, which has
 no ambiguity.
 
-\subsection{Too many files in the mission node}
+\subsection{Gripper: friction-only hold}
 
-As we added states, the mission node grew to 13 files.
-It became harder to understand and debug than if everything had
-been in fewer files.
-We reorganised it down to 5 files.
-Splitting code into many small files was not worth it for a project
-of this size.
+The stock RoboMaster gripper script in CoppeliaSim calls
+\texttt{sim.setObjectParent} to reparent any grasped object as a
+child of the gripper's attach point.
+With reparenting, the cube's orientation is locked to the gripper:
+any yaw rotation during driving would tilt the cube and cause it to
+miss the plate on release.
+We blocked \texttt{setObjectParent} entirely by overriding it with a
+no-op in a Lua shim that the scene builder injects into the gripper
+script, and instead rely on friction contact alone to hold the cube.
+To make this reliable we raised the friction coefficient to 1.0 on
+the gripper finger shapes and the cube (across all supported physics
+engines) and added linear and angular damping to the cube so it
+does not bounce or spin when first squeezed.
+
+\subsection{Removing the GO\_TO\_DOOR state}
+
+We originally included a \textbf{GO\_TO\_DOOR} state that drove the
+robot through the door after placing the cube on the plate.
+In testing, the monocular depth estimate for the door
+(height 0.50~m) had positional errors of 15--20~cm at the approach
+distances required for navigation.
+The door opening is only 0.80~m wide, so that error margin made
+reliable passage through the doorway impossible without repeated
+replanning.
+We removed the state entirely: the door is detected during
+exploration to count as one of the three required landmarks, but the
+mission ends at \textbf{DONE} once the cube is on the plate.
+
+\subsection{CoppeliaSim real-time mode watchdog}
+
+The \texttt{robomaster\_sim} plugin uses a 3-second
+\emph{simulation-time} heartbeat watchdog.
+Without real-time mode, CoppeliaSim advances roughly $3\times$ faster
+than wall clock, so the driver's 1~Hz heartbeat times out in about
+one real second, silently dropping \texttt{/odom}, \texttt{/imu},
+and all chassis topics for the rest of the run, while the simulator
+itself continued normally.
+The failure mode was a robot that stopped moving partway through
+exploration with no error in the ROS log.
+The fix was to call
+\texttt{sim.setBoolParam(\allowbreak boolparam\_realtime\_simulation,~True)}
+before starting the simulation, which is handled in \texttt{run.sh}.
 
 % =====================================================================
 \section{Conclusion}
@@ -426,6 +486,15 @@ We built an autonomous robot system that solves a simulated
 escape-room task: it explores an unknown room, finds three
 colour-coded objects, picks up the key cylinder with visual
 servoing, and drops it on the pressure plate.
+
+The system successfully completed all three scenario variants in
+testing.
+Exploration and navigation were reliable across runs; the most
+sensitive step was the visual-servo pickup, which occasionally
+struggled when the cube was placed close to a wall and the approach
+angle was narrow.
+The drop alignment was more consistent because it uses direct
+position control rather than camera-based depth estimation.
 
 The main lesson is that using an existing stack (Nav2 and
 slam\_toolbox) is much better than building a custom planner,
