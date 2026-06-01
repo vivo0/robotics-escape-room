@@ -1,8 +1,8 @@
 # robotics-escape-room
 
 CoppeliaSim + ROS 2 escape-room demo: a RoboMaster EP explores an unknown
-room, picks up a key, drops it on a pressure plate, and drives out the
-opened door. See [`CLAUDE.md`](CLAUDE.md) for architecture details.
+room, picks up a key (magenta cylinder), and drops it on a green pressure
+plate to complete the mission. See [`CLAUDE.md`](CLAUDE.md) for architecture details.
 
 ## Setup (macOS)
 

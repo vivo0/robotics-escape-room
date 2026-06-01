@@ -13,11 +13,10 @@
 #   4. colcon build the escape_room package and re-source the workspace
 #   5. Start the simulation in CoppeliaSim
 #   6. Launch robomaster_ros driver in the background, wait for /odom
-#   7. Launch the door controller in the background
-#   8. Run the discovery launch (mapper + TF) in the foreground (Ctrl-C to stop)
+#   7. Run the discovery launch (SLAM + Nav2 + mission FSM) in the foreground (Ctrl-C to stop)
 #
 # CoppeliaSim and the background ROS processes are left running after Ctrl-C.
-# Kill them with: pkill -f robomaster_driver; pkill -f door_controller
+# Kill them with: pkill -f robomaster_driver
 
 set -euo pipefail
 
@@ -33,7 +32,6 @@ _KILL_PATTERNS=(
     "robomaster_driver"
     "robot_state_publisher"
     "joint_state_publisher"
-    "door_controller"
 )
 
 kill_all() {
@@ -131,11 +129,7 @@ for i in $(seq 1 30); do
     fi
 done
 
-# 7. Launch the door controller in the background
-echo "[run] Launching door_controller in background..."
-ros2 run escape_room door_controller >/tmp/door_controller.log 2>&1 &
-
-# 8. Discovery launch in the foreground (mapper + static TF)
+# 7. Discovery launch in the foreground (SLAM + Nav2 + mission FSM)
 echo "[run] Launching discovery (SLAM + Nav2 + mission). Ctrl-C to stop..."
 trap 'kill_all' EXIT INT TERM
 ros2 launch escape_room discovery.launch.py

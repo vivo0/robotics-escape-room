@@ -2,110 +2,110 @@
 
 ## Goal
 
-Il robot è chiuso in una stanza con ostacoli. Deve trovare una **chiave** (cubo colorato), portarla su una **pressure plate** colorata per aprire una **porta** colorata, e uscire. Tre landmark distinti per colore, ciascuno scoperto una volta sola e poi ricordato.
+The robot is locked in a room with obstacles. It must find a **key** (magenta cylinder), carry it
+to a green **pressure plate**, and drop it there. Mission ends when the cube lands on the plate —
+the robot does not need to exit through the door.
 
-## Architettura a due fasi 
+## Two-phase architecture
 
-**Fase 1 — Discovery.** Il robot esplora reattivamente, costruisce in memoria una mappa degli ostacoli, e annota la posizione dei tre landmark man mano che li vede.
+**Phase 1 — Discovery.** The robot explores the room using frontier-based exploration (Nav2 +
+slam_toolbox), builds a live 2D SLAM map, and records each of the three landmark positions (cube,
+plate, door) as soon as it sees them via the camera.
 
-**Fase 2 — Execution.** Quando tutti e tre i landmark sono noti, il robot smette di esplorare e si muove "ad occhi chiusi" usando solo la mappa: pianifica con A*, segue il path con pure pursuit, raccoglie il cubo, lo deposita, esce.
+**Phase 2 — Execution.** Once all three landmarks are known the robot stops exploring and uses the
+SLAM map to: navigate to the cube (Nav2), pick it up with visual servoing + odometry lunge,
+navigate to the plate (Nav2), and deposit the cube with P-control on bearing and distance.
 
-## Nodi ROS
+## Tech stack
 
 ```
-┌─────────────────┐     ┌──────────────┐     ┌─────────────────┐
-│ color_detector  │────►│   mission    │◄────│     mapper      │
-│                 │     │ (state mach.)│     │                 │
-│ camera → poses  │     │              │     │ ToF → /map      │
-└─────────────────┘     └──────┬───────┘     └─────────────────┘
-                               │                       ▲
-                               ▼                       │
-                        ┌──────────────┐               │
-                        │   planner    │───────────────┘
-                        │  A* + follow │
-                        └──────────────┘
-                               │
-                               ▼ cmd_vel, gripper, leds
+CoppeliaSim (physics + ZMQ)
+  ├── lidar_sensor.lua  ──── /scan (LaserScan 10 Hz) ──► slam_toolbox → /map + map→odom TF
+  ├── robomaster_sim    ──── /odom + odom→base_link TF ──► Nav2
+  └── ZMQ ◄── Python (gripper open/close, cube lidar-visibility)
+
+ROS 2 nodes
+  ├── color_detector_node  ── /targets/{cube,plate,door} (latched, map frame)
+  │                        ── /targets/cube_live (base_link, every frame)
+  └── explorer_node        ── NavigateToPose → Nav2
+                           ── /cmd_vel (short-range manoeuvres)
 ```
 
-| Nodo | Responsabilità | Subscribe | Publish |
+- **CoppeliaSim 4.x** + `simExtROS2` plugin
+- **ROS 2** + `robomaster_ros` driver
+- **Python**: `rclpy`, `opencv-python`, `numpy`, `tf2_ros`, `cv_bridge`
+- **Nav2**: NavFn planner + Regulated Pure Pursuit + BT navigator
+- **slam_toolbox**: online async SLAM, loop closure disabled, 5 cm/cell
+- **RViz2**: map, scan, costmaps, path visualisation
+
+## ROS nodes
+
+| Node | Responsibility | Subscribes | Publishes |
 |---|---|---|---|
-| `color_detector` | Vede i 3 colori, stima pose in `odom`, una sola volta | `camera/image_color`, `camera/camera_info`, TF | `targets/cube`, `targets/plate`, `targets/door` (latched) |
-| `mapper` | Occupancy grid 2D via ray-casting dai ToF | `range_*`, `odom` | `/map` (`OccupancyGrid`) |
-| `planner` | A* su `/map` con inflation, pure pursuit follower | `/map`, goal via servizio | `cmd_vel` durante l'execution |
-| `mission` | State machine globale | tutti i topic sopra | comandi gripper/LEDs, attiva/disattiva planner |
+| `color_detector_node` | HSV blob → pose estimate **from camera only** (monocular depth or floor ray) + TF | `/camera/image_color` | `/targets/{cube,plate,door}` (latched), `/targets/cube_live`, `/targets/markers` |
+| `explorer_node` | Mission state machine | `/targets/*`, `/map`, `/targets/cube_live` | `NavigateToPose` (action), `/cmd_vel` |
 
-## Fase 1 — Discovery in dettaglio
+`slam_toolbox` and `Nav2` are external packages launched by `discovery.launch.py`.
 
-**Esplorazione**: random walk reattivo. Avanti finché ToF anteriori sono liberi, ostacolo → ruota di angolo casuale → riparti.
+## Perception (color_detector_node)
 
-**Mapping**: ad ogni lettura ToF, ray-casting nella grid. Celle attraversate dal raggio = libere, cella alla distanza misurata = occupata, mai osservate = ignote. Risoluzione 10 cm, stanza 5×4 m → 50×40 celle.
+All **perception-only** — no object positions are read from the simulator.
 
-**Color detection**: ogni frame della camera viene convertito in HSV, applicate maschere `cv2.inRange` per ciascun colore, trovati i blob, calcolato il centroide. Il pixel del centroide viene proiettato nel mondo intersecando il raggio con il piano `z = z_landmark` (noto per ciascun tipo). La posa viene trasformata da camera a `odom` via TF, e pubblicata su un topic latched `transient_local` — chi subscribe dopo riceve comunque l'ultimo valore.
+- **Cube / door** (upright, known height): monocular depth — `z = f_pix × real_height / pixel_height`. Back-project centroid to that depth → 3D point in `camera_optical_link` → TF → `map`. Skipped when blob touches image edge (clipped height → wrong depth).
+- **Plate** (flat, no usable height): ray through the centroid pixel, intersected with floor plane `z = 0` in map frame.
+- Camera FOV read from sim **once at init** (scalar constant for focal-length calculation; not a pose read).
+- Poses refined every frame while visible; latched on `/targets/*` so late subscribers still receive the last value.
+- Live cube stream on `/targets/cube_live` in `base_link` for visual-servoing during pickup.
 
-**Criterio di terminazione**: tutti e tre i landmark visti almeno una volta. Possibile timeout di sicurezza (es. 90s) per non bloccarsi.
-
-## Fase 2 — Execution in dettaglio
-
-**Path planning**: A* sulla occupancy grid, dopo aver applicato **inflation** (dilatazione morfologica di ~3 celle = raggio del robot) per tenere il path lontano dai muri. Ritorna una lista di waypoint.
-
-**Path following**: pure pursuit. Sceglie un punto sul path a ~30 cm davanti al robot, calcola angolo verso quel punto, comanda velocità lineare e angolare. Quando il punto finale è raggiunto entro tolleranza (es. 10 cm), passa allo stato successivo.
-
-**Manipolazione**: arrivato vicino al cubo, switch a visual servoing (centra il cubo nell'immagine, avvicinati lentamente, chiudi gripper). Stesso pattern per il rilascio sulla plate.
-
-## State machine
+## State machine (explorer_node)
 
 ```
-DISCOVERY ─────► tutti i landmark visti ──► PLAN_TO_CUBE
-PLAN_TO_CUBE ──► path calcolato ─────────► FOLLOW_TO_CUBE
-FOLLOW_TO_CUBE ► arrivato ────────────────► GRASP
-GRASP ─────────► cubo in mano ────────────► PLAN_TO_PLATE
-PLAN_TO_PLATE ─► path calcolato ─────────► FOLLOW_TO_PLATE
-FOLLOW_TO_PLATE► arrivato ────────────────► RELEASE
-RELEASE ───────► cubo rilasciato ─────────► PLAN_TO_DOOR
-PLAN_TO_DOOR ──► path calcolato ─────────► FOLLOW_TO_DOOR
-FOLLOW_TO_DOOR ► arrivato ────────────────► ESCAPED (LED + dance)
+EXPLORE ──────────► all 3 landmarks seen ────────────► GO_TO_KEY
+GO_TO_KEY ────────► Nav2 reached 0.9 m standoff ─────► PICKUP_OPEN
+PICKUP_OPEN ──────► gripper fully open ──────────────► PICKUP_ALIGN
+PICKUP_ALIGN ─────► visual servo + odometry lunge ───► PICKUP_CLOSE
+PICKUP_CLOSE ─────► gripper closed, cube hidden ──────► GO_TO_PLATE
+GO_TO_PLATE ──────► Nav2 reached plate ──────────────► DROP_ALIGN
+DROP_ALIGN ───────► P-control on yaw + distance ──────► DROP_OPEN
+DROP_OPEN ────────► gripper open, cube visible ───────► DROP_BACKUP
+DROP_BACKUP ──────► 0.25 m reverse (odometry) ────────► DONE ✓
 ```
 
-## Persistenza dei dati
+## Pickup details
 
-Tutto vive in memoria nei rispettivi nodi:
+**Long-range approach**: Nav2 drives the robot to a standoff point 0.9 m from the cube, facing it.
 
-- **Mappa**: `numpy.ndarray` dentro `mapper`, ripubblicata su `/map` ad ogni update.
-- **Landmark**: `PoseStamped` con QoS `TRANSIENT_LOCAL` dentro `color_detector`. Il publisher si "ricorda" l'ultimo valore e lo invia automaticamente a chi subscribe dopo.
-- **State**: variabile interna in `mission`.
+**Visual servoing** (PICKUP_ALIGN): P-controller on bearing from `/targets/cube_live` (base_link):
+1. Rotate until cube is centred in the image.
+2. Drive forward while keeping it centred.
+3. At ≤ 0.9 m the cylinder base starts clipping out of the camera's bottom edge — monocular depth becomes unreliable.
 
-A fine missione, `mission` può salvare `map.npy` + `targets.json` per il report.
+**Odometry lunge**: at 0.9 m the remaining distance is frozen and the robot advances open-loop
+measured by odometry (`odom` frame — smooth, no SLAM jumps). A 3 cm margin prevents nudging the
+cylinder over.
 
-## Convenzioni colore
+## Drop details
 
-| Landmark | Colore | Hue HSV (~) | Z nel mondo |
-|---|---|---|---|
-| Cubo (chiave) | Rosso saturo | 0–10 e 170–180 | 0.05 m |
-| Pressure plate | Verde saturo | 40–80 | 0.001 m |
-| Porta | Blu saturo | 100–130 | 0.50 m |
+**drop_align**: P-control on yaw error and distance error. Target distance = `engage_dist + lunge_margin`
+(≈ 0.207 m) — the position of the cube held in the gripper ahead of `base_link`. The cube lands
+at the plate centre.
 
-Nel JSON dello scenario, i `color` dei tre oggetti devono essere coerenti con queste fasce.
+**drop_backup**: straight reverse of 0.25 m (odometry-measured) before turning, so the open
+gripper does not sweep the cube off the plate.
 
-## Stack tecnico
+## Data persistence
 
-- **CoppeliaSim 4.10** + plugin `simExtROS2` per la simulazione
-- **ROS2** + driver `robomaster_ros` per il controllo del robot
-- **Python**: `rclpy`, `opencv-python` (color + visual servoing), `numpy` (grid + A*), `tf2_ros` (frame transforms), `cv_bridge` (ROS Image ↔ OpenCV)
-- **RViz2** per visualizzare mappa e path durante demo/video
+- **Map**: slam_toolbox, published on `/map` (TRANSIENT_LOCAL).
+- **Landmark poses**: `PoseStamped` with `TRANSIENT_LOCAL` QoS on `/targets/*` — late subscribers always receive the last value.
+- **FSM state**: in-memory variable inside `explorer_node`.
 
-## Roadmap incrementale
+## Colour conventions
 
-1. **MVP reattivo** (~1 settimana): no mapping, robot esplora a caso e usa visual servoing per andare sui landmark direttamente. Demo end-to-end funzionante.
-2. **+ Mapper passivo** (~4 giorni): aggiungi `mapper` in parallelo, visualizzi `/map` in RViz nel video. Controllo ancora reattivo.
-3. **+ Planner attivo** (~4 giorni): A* + pure pursuit. Discovery → Execution come descritto. "Ad occhi chiusi" realizzato.
+| Landmark | Colour | OpenCV HSV hue (~) |
+|---|---|---|
+| Cube (key) | Magenta | 140–170 |
+| Pressure plate | Green | 40–80 |
+| Door | Blue | 100–130 |
 
-Ogni tappa è consegnabile per conto suo. Se rimani indietro alla tappa 2, hai comunque un progetto solido.
-
-## Scope esplicito di cosa NON è incluso
-
-- SLAM (l'odometria di Coppelia in simulazione è perfetta, non serve).
-- Mappatura dinamica con oggetti che si muovono.
-- Distrattori dello stesso colore (un solo oggetto per colore).
-- Gestione di più stanze o porte multiple.
-- Recovery sofisticate da fallimenti del grasping.
+Scenario JSON `color` fields must match these ranges. The cube avoids red (floor/wall artefacts)
+and yellow (CoppeliaSim default floor pattern); magenta is the safe, distinct hue.
