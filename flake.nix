@@ -33,6 +33,9 @@
               texlab
               tex-fmt
               
+              # Image processing
+              imagemagick
+
               # Formatter
               self.formatter.${system}
             ];

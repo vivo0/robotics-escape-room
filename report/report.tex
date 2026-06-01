@@ -84,12 +84,14 @@ navigation by sending \texttt{NavigateToPose} goals to Nav2,
 and takes direct \texttt{cmd\_vel} control for the short-range
 pickup and drop manoeuvres.
 
-\begin{figure}[htbp]
-\centerline{\includegraphics[width=\columnwidth]{fig_architecture.png}}
-\caption{Node graph. White boxes: our components. Grey: third-party packages.
-Arrows show the main ROS~2 topics and actions between nodes.}
+\begin{figure*}[t]
+\centerline{\includegraphics[width=\textwidth]{fig_architecture.png}}
+\caption{System architecture in three layers: simulation (blue),
+perception and state estimation (green), and mission control (purple).
+Orange: Nav2 and slam\_toolbox (third-party). Arrows show ROS~2 topics,
+TF transforms, and the ZMQ side-channel.}
 \label{fig:arch}
-\end{figure}
+\end{figure*}
 
 \subsection{Scenario configuration}
 
@@ -154,11 +156,11 @@ Magenta was chosen for the cube because it does not appear in the
 floor or wall textures of the simulation.
 
 \begin{figure}[htbp]
-\centerline{\includegraphics[width=\columnwidth]{fig_camera_blob.png}}
-\caption{Camera view with HSV blob detection. Coloured overlays show
-the detected regions for the cube (magenta), pressure plate (green),
-and door (blue). The centroid of each blob is used to estimate
-the object's position.}
+\centerline{\includegraphics[width=\columnwidth]{fig_camera_pov.png}}
+\caption{Robot's camera view during exploration with HSV blob
+detection overlays. Detected regions for the cube (magenta),
+pressure plate (green), and door (blue). The centroid of each
+blob is used to estimate the object's position.}
 \label{fig:blob}
 \end{figure}
 
@@ -249,14 +251,8 @@ that point the FSM cancels any active Nav2 goal and transitions to
 
 \subsection{State machine overview}
 
-\begin{figure}[htbp]
-\centerline{\includegraphics[width=\columnwidth]{fig_fsm.png}}
-\caption{Mission state machine. Shaded states use Nav2 for driving;
-white states use direct velocity commands.}
-\label{fig:fsm}
-\end{figure}
 
-The mission controller (Fig.~\ref{fig:fsm}) runs as a timer callback
+The mission controller runs as a timer callback
 at 4~Hz. It waits at startup until Nav2, the occupancy map, and the
 robot's position in the map frame are all available, then advances
 through ten states:
