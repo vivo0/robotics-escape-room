@@ -1,288 +1,460 @@
 \documentclass[conference]{IEEEtran}
 \IEEEoverridecommandlockouts
-% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
-\usepackage{cite}
 \usepackage{amsmath,amssymb,amsfonts}
 \usepackage{algorithmic}
 \usepackage{graphicx}
 \usepackage{textcomp}
 \usepackage{xcolor}
+\usepackage{placeins}
 \def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
     T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
 \begin{document}
 
-\title{Conference Paper Title*\\
-{\footnotesize \textsuperscript{*}Note: Sub-titles are not captured in Xplore and
-should not be used}
-\thanks{Identify applicable funding agency here. If none, delete this.}
-}
+\title{Robot Navigation in a Simulated Escape Room}
 
-\author{\IEEEauthorblockN{1\textsuperscript{st} Given Name Surname}
-\IEEEauthorblockA{\textit{dept. name of organization (of Aff.)} \\
-\textit{name of organization (of Aff.)}\\
-City, Country \\
-email address or ORCID}
+\author{
+\IEEEauthorblockN{Student 1}
+\IEEEauthorblockA{\textit{Faculty of Informatics}\\
+\textit{Università della Svizzera italiana}\\
+Lugano, Switzerland}
 \and
-\IEEEauthorblockN{2\textsuperscript{nd} Given Name Surname}
-\IEEEauthorblockA{\textit{dept. name of organization (of Aff.)} \\
-\textit{name of organization (of Aff.)}\\
-City, Country \\
-email address or ORCID}
+\IEEEauthorblockN{Student 2}
+\IEEEauthorblockA{\textit{Faculty of Informatics}\\
+\textit{Università della Svizzera italiana}\\
+Lugano, Switzerland}
 \and
-\IEEEauthorblockN{3\textsuperscript{rd} Given Name Surname}
-\IEEEauthorblockA{\textit{dept. name of organization (of Aff.)} \\
-\textit{name of organization (of Aff.)}\\
-City, Country \\
-email address or ORCID}
-\and
-\IEEEauthorblockN{4\textsuperscript{th} Given Name Surname}
-\IEEEauthorblockA{\textit{dept. name of organization (of Aff.)} \\
-\textit{name of organization (of Aff.)}\\
-City, Country \\
-email address or ORCID}
-\and
-\IEEEauthorblockN{5\textsuperscript{th} Given Name Surname}
-\IEEEauthorblockA{\textit{dept. name of organization (of Aff.)} \\
-\textit{name of organization (of Aff.)}\\
-City, Country \\
-email address or ORCID}
-\and
-\IEEEauthorblockN{6\textsuperscript{th} Given Name Surname}
-\IEEEauthorblockA{\textit{dept. name of organization (of Aff.)} \\
-\textit{name of organization (of Aff.)}\\
-City, Country \\
-email address or ORCID}
+\IEEEauthorblockN{Student 3}
+\IEEEauthorblockA{\textit{Faculty of Informatics}\\
+\textit{Università della Svizzera italiana}\\
+Lugano, Switzerland}
 }
 
 \maketitle
 
 \begin{abstract}
-This document is a model and instructions for \LaTeX.
-This and the IEEEtran.cls file define the components of your paper [title, text, heads, etc.]. *CRITICAL: Do Not Use Symbols, Special Characters, Footnotes, 
-or Math in Paper Title or Abstract.
+This paper describes an autonomous robot system built for a
+simulated escape-room task.
+A DJI RoboMaster~EP robot, running in CoppeliaSim, must explore
+an unknown room, find a coloured key cylinder, pick it up, and
+place it on a pressure plate.
+The robot uses only wheel-encoder odometry, a 2D lidar scan,
+and a monocular camera.
+We built three components on top of ROS~2, Nav2, and slam\_toolbox:
+a lidar sensor script injected into the simulator, a colour-based
+landmark detector using monocular depth estimation, and a nine-state
+mission controller that combines Nav2 path planning with
+visual servoing for the pickup.
+The robot completes the full task from start to finish.
 \end{abstract}
 
 \begin{IEEEkeywords}
-component, formatting, style, styling, insert
+autonomous mobile robotics, ROS~2, Nav2, slam\_toolbox,
+visual servoing, frontier exploration, monocular depth
 \end{IEEEkeywords}
 
+% =====================================================================
 \section{Introduction}
-This document is a model and instructions for \LaTeX.
-Please observe the conference page limits. 
 
-\section{Ease of Use}
-
-\subsection{Maintaining the Integrity of the Specifications}
-
-The IEEEtran class file is used to format your paper and style the text. All margins, 
-column widths, line spaces, and text fonts are prescribed; please do not 
-alter them. You may note peculiarities. For example, the head margin
-measures proportionately more than is customary. This measurement 
-and others are deliberate, using specifications that anticipate your paper 
-as one part of the entire proceedings, and not as an independent document. 
-Please do not revise any of the current designations.
-
-\section{Prepare Your Paper Before Styling}
-Before you begin to format your paper, first write and save the content as a 
-separate text file. Complete all content and organizational editing before 
-formatting. Please note sections \ref{AA}--\ref{SCM} below for more information on 
-proofreading, spelling and grammar.
-
-Keep your text and graphic files separate until after the text has been 
-formatted and styled. Do not number text heads---{\LaTeX} will do that 
-for you.
-
-\subsection{Abbreviations and Acronyms}\label{AA}
-Define abbreviations and acronyms the first time they are used in the text, 
-even after they have been defined in the abstract. Abbreviations such as 
-IEEE, SI, MKS, CGS, ac, dc, and rms do not have to be defined. Do not use 
-abbreviations in the title or heads unless they are unavoidable.
-
-\subsection{Units}
-\begin{itemize}
-\item Use either SI (MKS) or CGS as primary units. (SI units are encouraged.) English units may be used as secondary units (in parentheses). An exception would be the use of English units as identifiers in trade, such as ``3.5-inch disk drive''.
-\item Avoid combining SI and CGS units, such as current in amperes and magnetic field in oersteds. This often leads to confusion because equations do not balance dimensionally. If you must use mixed units, clearly state the units for each quantity that you use in an equation.
-\item Do not mix complete spellings and abbreviations of units: ``Wb/m\textsuperscript{2}'' or ``webers per square meter'', not ``webers/m\textsuperscript{2}''. Spell out units when they appear in text: ``. . . a few henries'', not ``. . . a few H''.
-\item Use a zero before decimal points: ``0.25'', not ``.25''. Use ``cm\textsuperscript{3}'', not ``cc''.)
-\end{itemize}
-
-\subsection{Equations}
-Number equations consecutively. To make your 
-equations more compact, you may use the solidus (~/~), the exp function, or 
-appropriate exponents. Italicize Roman symbols for quantities and variables, 
-but not Greek symbols. Use a long dash rather than a hyphen for a minus 
-sign. Punctuate equations with commas or periods when they are part of a 
-sentence, as in:
-\begin{equation}
-a+b=\gamma\label{eq}
-\end{equation}
-
-Be sure that the 
-symbols in your equation have been defined before or immediately following 
-the equation. Use ``\eqref{eq}'', not ``Eq.~\eqref{eq}'' or ``equation \eqref{eq}'', except at 
-the beginning of a sentence: ``Equation \eqref{eq} is . . .''
-
-\subsection{\LaTeX-Specific Advice}
-
-Please use ``soft'' (e.g., \verb|\eqref{Eq}|) cross references instead
-of ``hard'' references (e.g., \verb|(1)|). That will make it possible
-to combine sections, add equations, or change the order of figures or
-citations without having to go through the file line by line.
-
-Please don't use the \verb|{eqnarray}| equation environment. Use
-\verb|{align}| or \verb|{IEEEeqnarray}| instead. The \verb|{eqnarray}|
-environment leaves unsightly spaces around relation symbols.
-
-Please note that the \verb|{subequations}| environment in {\LaTeX}
-will increment the main equation counter even when there are no
-equation numbers displayed. If you forget that, you might write an
-article in which the equation numbers skip from (17) to (20), causing
-the copy editors to wonder if you've discovered a new method of
-counting.
-
-{\BibTeX} does not work by magic. It doesn't get the bibliographic
-data from thin air but from .bib files. If you use {\BibTeX} to produce a
-bibliography you must send the .bib files. 
-
-{\LaTeX} can't read your mind. If you assign the same label to a
-subsubsection and a table, you might find that Table I has been cross
-referenced as Table IV-B3. 
-
-{\LaTeX} does not have precognitive abilities. If you put a
-\verb|\label| command before the command that updates the counter it's
-supposed to be using, the label will pick up the last counter to be
-cross referenced instead. In particular, a \verb|\label| command
-should not go before the caption of a figure or a table.
-
-Do not use \verb|\nonumber| inside the \verb|{array}| environment. It
-will not stop equation numbers inside \verb|{array}| (there won't be
-any anyway) and it might stop a wanted equation number in the
-surrounding equation.
-
-\subsection{Some Common Mistakes}\label{SCM}
-\begin{itemize}
-\item The word ``data'' is plural, not singular.
-\item The subscript for the permeability of vacuum $\mu_{0}$, and other common scientific constants, is zero with subscript formatting, not a lowercase letter ``o''.
-\item In American English, commas, semicolons, periods, question and exclamation marks are located within quotation marks only when a complete thought or name is cited, such as a title or full quotation. When quotation marks are used, instead of a bold or italic typeface, to highlight a word or phrase, punctuation should appear outside of the quotation marks. A parenthetical phrase or statement at the end of a sentence is punctuated outside of the closing parenthesis (like this). (A parenthetical sentence is punctuated within the parentheses.)
-\item A graph within a graph is an ``inset'', not an ``insert''. The word alternatively is preferred to the word ``alternately'' (unless you really mean something that alternates).
-\item Do not use the word ``essentially'' to mean ``approximately'' or ``effectively''.
-\item In your paper title, if the words ``that uses'' can accurately replace the word ``using'', capitalize the ``u''; if not, keep using lower-cased.
-\item Be aware of the different meanings of the homophones ``affect'' and ``effect'', ``complement'' and ``compliment'', ``discreet'' and ``discrete'', ``principal'' and ``principle''.
-\item Do not confuse ``imply'' and ``infer''.
-\item The prefix ``non'' is not a word; it should be joined to the word it modifies, usually without a hyphen.
-\item There is no period after the ``et'' in the Latin abbreviation ``et al.''.
-\item The abbreviation ``i.e.'' means ``that is'', and the abbreviation ``e.g.'' means ``for example''.
-\end{itemize}
-An excellent style manual for science writers is \cite{b7}.
-
-\subsection{Authors and Affiliations}
-\textbf{The class file is designed for, but not limited to, six authors.} A 
-minimum of one author is required for all conference articles. Author names 
-should be listed starting from left to right and then moving down to the 
-next line. This is the author sequence that will be used in future citations 
-and by indexing services. Names should not be listed in columns nor group by 
-affiliation. Please keep your affiliations as succinct as possible (for 
-example, do not differentiate among departments of the same organization).
-
-\subsection{Identify the Headings}
-Headings, or heads, are organizational devices that guide the reader through 
-your paper. There are two types: component heads and text heads.
-
-Component heads identify the different components of your paper and are not 
-topically subordinate to each other. Examples include Acknowledgments and 
-References and, for these, the correct style to use is ``Heading 5''. Use 
-``figure caption'' for your Figure captions, and ``table head'' for your 
-table title. Run-in heads, such as ``Abstract'', will require you to apply a 
-style (in this case, italic) in addition to the style provided by the drop 
-down menu to differentiate the head from the text.
-
-Text heads organize the topics on a relational, hierarchical basis. For 
-example, the paper title is the primary text head because all subsequent 
-material relates and elaborates on this one topic. If there are two or more 
-sub-topics, the next level head (uppercase Roman numerals) should be used 
-and, conversely, if there are not at least two sub-topics, then no subheads 
-should be introduced.
-
-\subsection{Figures and Tables}
-\paragraph{Positioning Figures and Tables} Place figures and tables at the top and 
-bottom of columns. Avoid placing them in the middle of columns. Large 
-figures and tables may span across both columns. Figure captions should be 
-below the figures; table heads should appear above the tables. Insert 
-figures and tables after they are cited in the text. Use the abbreviation 
-``Fig.~\ref{fig}'', even at the beginning of a sentence.
-
-\begin{table}[htbp]
-\caption{Table Type Styles}
-\begin{center}
-\begin{tabular}{|c|c|c|c|}
-\hline
-\textbf{Table}&\multicolumn{3}{|c|}{\textbf{Table Column Head}} \\
-\cline{2-4} 
-\textbf{Head} & \textbf{\textit{Table column subhead}}& \textbf{\textit{Subhead}}& \textbf{\textit{Subhead}} \\
-\hline
-copy& More table copy$^{\mathrm{a}}$& &  \\
-\hline
-\multicolumn{4}{l}{$^{\mathrm{a}}$Sample of a Table footnote.}
-\end{tabular}
-\label{tab1}
-\end{center}
-\end{table}
+This project is an escape-room task in simulation.
+A DJI RoboMaster~EP robot is placed in a room with obstacles and
+must find a magenta cylinder (the key), pick it up, and drop it on
+a green pressure plate to finish.
+The room layout and object positions are not known in advance.
 
 \begin{figure}[htbp]
-\centerline{\includegraphics{fig1.png}}
-\caption{Example of a figure caption.}
-\label{fig}
+\centerline{\includegraphics[width=\columnwidth]{fig_scenarios.png}}
+\caption{The three scenario variants (easy, medium, hard) shown
+from above in CoppeliaSim. Obstacle count and placement increase
+across scenarios; the robot spawn, key, and plate positions also
+change.}
+\label{fig:scenarios}
 \end{figure}
 
-Figure Labels: Use 8 point Times New Roman for Figure labels. Use words 
-rather than symbols or abbreviations when writing Figure axis labels to 
-avoid confusing the reader. As an example, write the quantity 
-``Magnetization'', or ``Magnetization, M'', not just ``M''. If including 
-units in the label, present them within parentheses. Do not label axes only 
-with units. In the example, write ``Magnetization (A/m)'' or ``Magnetization 
-\{A[m(1)]\}'', not just ``A/m''. Do not label axes with a ratio of 
-quantities and units. For example, write ``Temperature (K)'', not 
-``Temperature/K''.
+The simulation runs in CoppeliaSim with the
+\texttt{robomaster\_sim} plugin and \texttt{robomaster\_ros} driver.
+We built three custom components on top of
+\texttt{slam\_toolbox} and Nav2:
+a lidar sensor, a colour detector, and a mission controller.
 
-\section*{Acknowledgment}
+The rest of the paper is structured as follows.
+Section~\ref{sec:arch} explains the overall system.
+Sections~\ref{sec:perception}--\ref{sec:mission} describe each component.
+Section~\ref{sec:challenges} covers the problems we ran into and how
+we fixed them.
+Section~\ref{sec:conclusion} concludes.
 
-The preferred spelling of the word ``acknowledgment'' in America is without 
-an ``e'' after the ``g''. Avoid the stilted expression ``one of us (R. B. 
-G.) thanks $\ldots$''. Instead, try ``R. B. G. thanks$\ldots$''. Put sponsor 
-acknowledgments in the unnumbered footnote on the first page.
+% =====================================================================
+\section{System Architecture}
+\label{sec:arch}
 
-\section*{References}
+\subsection{Simulator--ROS bridge}
 
-Please number citations consecutively within brackets \cite{b1}. The 
-sentence punctuation follows the bracket \cite{b2}. Refer simply to the reference 
-number, as in \cite{b3}---do not use ``Ref. \cite{b3}'' or ``reference \cite{b3}'' except at 
-the beginning of a sentence: ``Reference \cite{b3} was the first $\ldots$''
+CoppeliaSim provides a remote API over ZMQ.
+We use it in three places: (1) a scene-building script that constructs
+the room from a JSON file at startup; (2) the colour detector reads the
+camera field-of-view angle once at startup for the depth calculation;
+(3) the mission controller opens and closes the gripper and hides or
+shows the cube to the lidar as needed.
 
-Number footnotes separately in superscripts. Place the actual footnote at 
-the bottom of the column in which it was cited. Do not put footnotes in the 
-abstract or reference list. Use letters for table footnotes.
+\subsection{Node graph and data flow}
 
-Unless there are six authors or more give all authors' names; do not use 
-``et al.''. Papers that have not been published, even if they have been 
-submitted for publication, should be cited as ``unpublished'' \cite{b4}. Papers 
-that have been accepted for publication should be cited as ``in press'' \cite{b5}. 
-Capitalize only the first word in a paper title, except for proper nouns and 
-element symbols.
+\begin{figure}[htbp]
+\centerline{\includegraphics[width=\columnwidth]{fig_architecture.png}}
+\caption{Node graph. White boxes: our components. Grey: third-party packages.
+Arrows show the main ROS~2 topics and actions between nodes.}
+\label{fig:arch}
+\end{figure}
 
-For papers published in translation journals, please give the English 
-citation first, followed by the original foreign-language citation \cite{b6}.
+Fig.~\ref{fig:arch} shows the data flow between all nodes.
 
-\begin{thebibliography}{00}
-\bibitem{b1} G. Eason, B. Noble, and I. N. Sneddon, ``On certain integrals of Lipschitz-Hankel type involving products of Bessel functions,'' Phil. Trans. Roy. Soc. London, vol. A247, pp. 529--551, April 1955.
-\bibitem{b2} J. Clerk Maxwell, A Treatise on Electricity and Magnetism, 3rd ed., vol. 2. Oxford: Clarendon, 1892, pp.68--73.
-\bibitem{b3} I. S. Jacobs and C. P. Bean, ``Fine particles, thin films and exchange anisotropy,'' in Magnetism, vol. III, G. T. Rado and H. Suhl, Eds. New York: Academic, 1963, pp. 271--350.
-\bibitem{b4} K. Elissa, ``Title of paper if known,'' unpublished.
-\bibitem{b5} R. Nicole, ``Title of paper with only first word capitalized,'' J. Name Stand. Abbrev., in press.
-\bibitem{b6} Y. Yorozu, M. Hirano, K. Oka, and Y. Tagawa, ``Electron spectroscopy studies on magneto-optical media and plastic substrate interface,'' IEEE Transl. J. Magn. Japan, vol. 2, pp. 740--741, August 1987 [Digests 9th Annual Conf. Magnetics Japan, p. 301, 1982].
-\bibitem{b7} M. Young, The Technical Writer's Handbook. Mill Valley, CA: University Science, 1989.
-\end{thebibliography}
-\vspace{12pt}
-\color{red}
-IEEE conference templates contain guidance text for composing and formatting conference papers. Please ensure that all template text is removed from your conference paper prior to submission to the conference. Failure to remove the template text from your paper may result in your paper not being published.
+\subsection{Scenario configuration}
+
+The room, obstacles, and task objects are all defined in a JSON file
+that is passed to the scene builder at startup.
+The file contains: room size and wall thickness; door openings;
+a list of obstacles (type, position, size, colour); the key cylinder;
+and the pressure plate.
+The scene builder connects to CoppeliaSim, removes any previous
+objects, and builds the room from scratch.
+This means changing the scenario only requires swapping the JSON file,
+no code changes are needed.
+Two scenarios are included: \texttt{easy.json} (5$\times$4~m room,
+three obstacles) and \texttt{medium.json} (same room, four obstacles
+with a wall-length divider, offset door, and different robot start).
+The colours in the JSON must match the HSV thresholds in the
+colour detector.
+
+\subsection{Coordinate frames}
+
+The TF tree is:
+\texttt{map\,$\to$\,odom\,$\to$\,base\_link\,$\to$\,laser\_link}.
+\texttt{slam\_toolbox} provides \texttt{map\,$\to$\,odom};
+\texttt{robomaster\_ros} provides \texttt{odom\,$\to$\,base\_link};
+a static publisher provides \texttt{base\_link\,$\to$\,laser\_link}
+at $z = 0.12$~m.
+The camera frame \texttt{camera\_optical\_link} is also published
+by \texttt{robomaster\_ros} and is used by the colour detector to
+convert pixel detections to 3D positions.
+
+% =====================================================================
+\section{Perception}
+\label{sec:perception}
+
+\subsection{Lidar sensor}
+
+CoppeliaSim does not publish laser scans for ROS~2 by default.
+We wrote a Lua script that is injected into the simulator at startup
+and attached to the robot.
+Each cycle (10~Hz) the script rotates a ray sensor to each of
+$N = 360$ angles $\theta_i = -\pi + i\,(2\pi/N)$, reads the hit
+distance, and publishes the result as a laser scan.
+The robot body is made invisible to the ray sensor so that rays
+pass through the chassis and only hit walls and obstacles.
+
+\subsection{Colour landmark detection}
+
+To find the three landmarks (cube, plate, door), the colour detector
+processes each camera frame in HSV colour space.
+For each target it applies a colour mask, finds connected blobs, and
+keeps the largest one that exceeds a minimum size.
+The colour ranges used are: cube (magenta, $H \in [140,170]$),
+plate (green, $H \in [40,80]$), door (blue, $H \in [100,130]$)
+(OpenCV convention, $H \in [0,179]$).
+Magenta was chosen for the cube because it does not appear in the
+floor or wall textures of the simulation.
+
+\begin{figure}[htbp]
+\centerline{\includegraphics[width=\columnwidth]{fig_camera_blob.png}}
+\caption{Camera view with HSV blob detection. Coloured overlays show
+the detected regions for the cube (magenta), pressure plate (green),
+and door (blue). The centroid of each blob is used to estimate
+the object's position.}
+\label{fig:blob}
+\end{figure}
+
+\subsubsection{Depth from known height (cube and door)}
+
+The cube and door are upright objects with known real heights
+(0.20~m and 0.50~m).
+Using the pinhole camera model, if an object of real height $H$
+appears as $h_{\mathrm{px}}$ pixels tall in the image, its depth is:
+
+\begin{equation}
+  z = \frac{f \cdot H}{h_{\mathrm{px}}},
+  \label{eq:mono}
+\end{equation}
+
+where $f$ is the focal length in pixels, computed from the camera
+field-of-view angle $\alpha$:
+$f = (w/2) / \tan(\alpha/2)$.
+The centroid pixel $(c_x, c_y)$ is then converted to a 3D point in
+the camera frame:
+
+\begin{equation}
+  \mathbf{p}_{\mathrm{cam}} =
+  \Bigl(\tfrac{c_x - w/2}{f}\,z,\;\tfrac{c_y - h/2}{f}\,z,\;z\Bigr),
+\end{equation}
+
+and transformed to the map frame using the TF tree.
+Frames where the blob touches the image edge are skipped because
+the pixel height would be cut off and the depth would be wrong.
+
+\subsubsection{Floor-ray intersection (pressure plate)}
+
+The plate is flat on the floor, so measuring its pixel height does
+not give a useful depth.
+Instead, we shoot a ray through the centroid pixel, transform both
+the ray origin and direction to the map frame, and find where the ray
+crosses the floor plane ($z = 0$):
+
+\begin{equation}
+  s = \frac{-o_z}{p_z - o_z}, \quad
+  (x,y) = (o_x + s\,(p_x - o_x),\; o_y + s\,(p_y - o_y)),
+\end{equation}
+
+where $\mathbf{o}$ is the camera origin and $\mathbf{p}$ is a point
+one unit along the ray, both in the map frame.
+This works regardless of the plate's size.
+
+\subsubsection{Live cube position for the pickup}
+
+The cube position in the robot frame (\texttt{base\_link}) is also
+published every frame on a separate topic.
+The pickup controller uses this to always have a fresh direction
+towards the cube.
+
+% =====================================================================
+\section{Navigation and Mapping}
+\label{sec:nav}
+
+\subsection{SLAM}
+
+\texttt{slam\_toolbox} runs in online mode and
+builds a 2D occupancy map at 5~cm per cell from the lidar scan and
+odometry.
+We disabled loop closure because in a small 5$\times$4~m room it
+caused sudden jumps in the map transform when the robot passed through
+the same area twice.
+Those jumps caused Nav2 to abort its current goal.
+Without loop closure, the map is accurate enough for the task.
+
+\begin{figure}[htbp]
+\centerline{\includegraphics[width=\columnwidth]{fig_map.png}}
+\caption{Occupancy grid map built by slam\_toolbox during exploration.
+White cells are free space, black cells are obstacles, and grey is
+unexplored. The planned path from Nav2 is shown in green.}
+\label{fig:map}
+\end{figure}
+
+\subsection{Nav2}
+
+Nav2 handles all long-range path planning and following.
+We use the NavFn planner (Dijkstra) with a 0.5~m goal tolerance and
+the Regulated Pure Pursuit controller at 0.15~m/s.
+The local costmap is a 2$\times$2~m rolling window with 0.35~m
+inflation around obstacles.
+The global costmap covers the full map.
+
+\subsection{Frontier exploration}
+
+To explore the room the robot uses frontier-based
+exploration.
+A frontier cell is a free cell (map value 0) that has at least one
+unknown neighbour (map value $-1$).
+Adjacent frontier cells are grouped into clusters using BFS;
+clusters with fewer than 20 cells are ignored.
+The robot always drives to the closest cluster centre.
+Exploration stops once all three landmarks have been seen.
+
+% =====================================================================
+\section{Mission Execution}
+\label{sec:mission}
+
+\subsection{State machine}
+
+\begin{figure}[htbp]
+\centerline{\includegraphics[width=\columnwidth]{fig_fsm.png}}
+\caption{Mission state machine. Shaded states use Nav2 for driving;
+white states use direct velocity commands.}
+\label{fig:fsm}
+\end{figure}
+
+The mission controller (Fig.~\ref{fig:fsm}) runs as a state machine
+at 4~Hz.
+It waits at startup until Nav2, the map, and the robot position are
+all available, then runs through nine states:
+\textbf{EXPLORE} $\to$ \textbf{GO\_TO\_KEY} $\to$
+\textbf{PICKUP\_OPEN} $\to$ \textbf{PICKUP\_ALIGN} $\to$
+\textbf{PICKUP\_CLOSE} $\to$ \textbf{GO\_TO\_PLATE} $\to$
+\textbf{DROP\_ALIGN} $\to$ \textbf{DROP\_OPEN} $\to$
+\textbf{DROP\_BACKUP} $\to$ \textbf{DONE}.
+
+\subsection{Navigation states}
+
+\textbf{GO\_TO\_KEY} sends a Nav2 goal to a point 0.9~m in front of
+the cube, facing it.
+\textbf{GO\_TO\_PLATE} sends a goal to the plate position.
+If Nav2 fails (for example, a partial plan near a wall), the goal
+is retried automatically.
+
+\begin{figure}[htbp]
+\centerline{\includegraphics[width=\columnwidth]{fig_stage_explore.png}}
+\caption{EXPLORE state: the robot drives toward the nearest frontier
+while slam\_toolbox builds the map. The planned path and current
+costmap are visible in RViz.}
+\label{fig:stage_explore}
+\end{figure}
+
+\FloatBarrier
+\subsection{Pickup (PICKUP\_ALIGN)}
+
+The pickup works in two steps.
+First, the robot uses the live cube position from the camera:
+it turns to face the cube and drives forward while keeping it centred
+(proportional control on the yaw error).
+
+At about 0.9~m from the cube, the bottom of the 0.20~m cylinder
+moves below the camera's field of view.
+At that point the pixel height $h_\mathrm{px}$ in~\eqref{eq:mono}
+becomes wrong, so the depth estimate is no longer reliable.
+The robot therefore switches to an \emph{odometry lunge}: it drives
+straight ahead by a fixed distance measured from the odometry, not
+from SLAM (the SLAM map transform can jump, while odometry is smooth
+over short distances).
+The lunge distance is:
+$d_\mathrm{lunge} = r - d_\mathrm{engage} - d_\mathrm{margin}$,
+where $r = 0.9$~m is the frozen range, $d_\mathrm{engage} = 0.177$~m
+is the gripper reach, and $d_\mathrm{margin} = 0.03$~m avoids
+tipping the thin cylinder.
+The gripper then closes.
+
+\begin{figure}[htbp]
+\centerline{\includegraphics[width=\columnwidth]{fig_stage_pickup.png}}
+\caption{PICKUP\_ALIGN state: the robot approaches the magenta
+cylinder using visual servoing. The camera view (inset) shows the
+cube centred in the frame just before the odometry lunge.}
+\label{fig:stage_pickup}
+\end{figure}
+
+While the cube is being carried, it is hidden from the lidar so that
+Nav2 does not see it as a wall in front of the robot.
+
+\FloatBarrier
+\subsection{Drop (DROP\_ALIGN, DROP\_OPEN, DROP\_BACKUP)}
+
+\begin{figure}[htbp]
+\centerline{\includegraphics[width=\columnwidth]{fig_stage_drop.png}}
+\caption{DROP\_OPEN state: the cube has been placed on the green
+pressure plate. The robot is backing away before turning.}
+\label{fig:stage_drop}
+\end{figure}
+
+Nav2's position tolerance of 0.25~m is too large for a 0.3~m plate.
+After arriving near the plate, the robot switches to direct velocity
+control for the final alignment: it faces the plate and drives until
+the cube's estimated position (gripper reach ahead of the robot)
+matches the plate centre, within 0.03~m.
+The gripper then opens and the cube becomes visible to the lidar again.
+Finally the robot reverses 0.25~m in a straight line before turning,
+so that the gripper does not push the cube off the plate.
+
+% =====================================================================
+\FloatBarrier
+\section{Engineering Challenges}
+\label{sec:challenges}
+
+\subsection{Replacing a custom stack with Nav2 and slam\_toolbox}
+
+The first version used a script that read all object positions from
+the simulator directly, published them as perfect odometry, and used
+a custom Python mapper with an A* planner.
+This worked but was unreliable: timing problems in the API calls
+corrupted the pose, and the mapper had no scan matching.
+We replaced everything with \texttt{slam\_toolbox} and Nav2, using
+real wheel-encoder odometry.
+This was a lot of work to configure (costmaps, controller tuning,
+recovery behaviours) but gave us a much more reliable system.
+
+\subsection{Lidar: Python node to Lua script}
+
+The first lidar was a Python ROS~2 node that asked the simulator for
+distances to each obstacle one by one.
+This was slow and depended on knowing the object list in advance.
+We replaced it with a Lua script running inside the simulator that
+rotates a native ray sensor and reads distances directly.
+This is much faster and works for any scene.
+
+\subsection{Colour detector: fixing the coordinate transform}
+
+The first version of the colour detector estimated positions in the
+robot's local frame using a manual rotation based on the starting
+heading.
+This broke as soon as the robot turned.
+We rewrote it to use the full TF tree, transforming each detection
+from the camera frame to the map frame.
+This works at any robot pose.
+
+\subsection{Loop closure jumping}
+
+With loop closure enabled, \texttt{slam\_toolbox} sometimes applied a
+large correction to the map transform when the robot revisited a
+known area.
+This moved the robot's estimated position by 0.3--0.5~m instantly,
+which made Nav2 abort its current goal.
+We disabled loop closure.
+The map quality did not noticeably worsen in this small room.
+
+\subsection{Pickup: waypoint to visual servo to odometry lunge}
+
+The first pickup strategy drove to a fixed position offset from the
+cube's known location.
+The gripper missed often because the position estimate was off by
+5--10~cm.
+We switched to visual servoing, which keeps the cube centred in the
+camera during the approach and does not depend on map accuracy.
+
+We then found a second problem: below 0.9~m, the cylinder base
+disappears from the camera's view, making the depth estimate
+unreliable.
+We added the odometry lunge to handle this last stretch, where
+odometry is accurate enough for the short straight-line distance
+involved.
+
+\subsection{CoppeliaSim Euler angle bug}
+
+When setting object orientations using Euler angles, CoppeliaSim
+silently reorders the angles in some cases (swapping roll and yaw),
+so the robot spawned facing the wrong direction.
+We fixed this by using the rotation matrix API instead, which has
+no ambiguity.
+
+\subsection{Too many files in the mission node}
+
+As we added states, the mission node grew to 13 files.
+It became harder to understand and debug than if everything had
+been in fewer files.
+We reorganised it down to 5 files.
+Splitting code into many small files was not worth it for a project
+of this size.
+
+% =====================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We built an autonomous robot system that solves a simulated
+escape-room task: it explores an unknown room, finds three
+colour-coded objects, picks up the key cylinder with visual
+servoing, and drops it on the pressure plate.
+
+The main lesson is that using an existing stack (Nav2 and
+slam\_toolbox) is much better than building a custom planner,
+even though configuring it took significant effort.
+The visual-servo pickup and the odometry lunge were necessary to
+make the manipulation reliable, because map-based position estimates
+were not accurate enough close to the object.
+
+Future improvements could include better recovery when the cube is
+dropped during transport, support for multi-room layouts, or a
+depth camera to make the pickup more robust.
 
 \end{document}
