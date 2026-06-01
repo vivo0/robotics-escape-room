@@ -1,0 +1,1202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Autonomous Escape Room — mapping &amp; grasping without ground-truth</title>
+
+<!-- reveal.js core from CDN -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/reveal.min.css">
+
+<!-- Fonts: Inter + JetBrains Mono (per brief) -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+<style>
+/* ===========================================================
+   DESIGN SYSTEM — Escape Room Robotics deck
+   Light, minimal, editorial, image-forward. Exact palette §1.
+   =========================================================== */
+:root{
+  --bg:#FBFBFD;
+  --surface:#FFFFFF;
+  --ink:#1B1B1F;
+  --muted:#6B6B73;
+  --accent:#0E7C86;        /* USI teal */
+  --accent2:#2E9E5B;       /* green: demo / success */
+  --hair:#E6E6EA;
+  --tint:#EAF4F5;          /* pale teal decorative */
+  --radius:12px;
+  --shadow:0 1px 2px rgba(27,27,31,.04), 0 8px 24px rgba(27,27,31,.06);
+}
+
+/* reveal overrides ------------------------------------------------ */
+.reveal{
+  font-family:'Inter', system-ui, sans-serif;
+  font-size:26px;
+  color:var(--ink);
+  font-weight:400;
+}
+.reveal .slides{ text-align:left; }
+.reveal-viewport{ background:var(--bg); }
+.reveal .slides section{
+  width:1280px; height:720px;
+  padding:0;
+  box-sizing:border-box;
+}
+
+/* the inner padded frame every content slide uses */
+.frame{
+  position:absolute; inset:0;
+  padding:64px 64px 56px 64px;
+  box-sizing:border-box;
+  overflow:hidden;
+}
+
+/* typography ------------------------------------------------------ */
+.reveal h1{
+  font-size:44px; font-weight:700; line-height:1.12;
+  color:var(--ink); margin:0; letter-spacing:-.01em;
+  text-transform:none;
+}
+.reveal h1 .sub{ font-weight:400; color:var(--muted); }
+.reveal p{ font-size:26px; line-height:1.5; margin:0 0 .4em; }
+.kbd, .mono, code{
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+}
+.pill{
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+  font-size:.86em; font-weight:500;
+  background:var(--tint); color:var(--accent);
+  padding:1px 7px; border-radius:6px;
+  white-space:nowrap;
+}
+.key{ color:var(--accent); font-weight:600; }
+.ok{ color:var(--accent2); font-weight:600; }
+
+/* the teal title rule */
+.titlebar{ margin:0 0 22px; }
+.titlebar h1{ margin:0; }
+.rule{
+  width:80px; height:3px; background:var(--accent);
+  border-radius:2px; margin:14px 0 0;
+}
+
+/* body bullets ---------------------------------------------------- */
+.reveal ul{ list-style:none; margin:0; padding:0; }
+.reveal ul li{
+  position:relative; padding-left:22px; margin:0 0 13px;
+  font-size:25px; line-height:1.45; color:var(--ink);
+}
+.reveal ul li::before{
+  content:""; position:absolute; left:2px; top:.62em;
+  width:7px; height:7px; border-radius:2px;
+  background:var(--accent); transform:rotate(45deg);
+}
+.reveal ul li .muted{ color:var(--muted); }
+.muted{ color:var(--muted); }
+
+/* layout helpers -------------------------------------------------- */
+.split{ display:grid; gap:40px; height:100%; align-items:center; }
+.split.v55{ grid-template-columns:42% 1fr; }     /* visual >=55% on right */
+.split.v55-left{ grid-template-columns:1fr 42%; } /* visual on left */
+.textcol{ align-self:center; }
+.viscol{ align-self:center; min-width:0; }
+
+/* figure card ----------------------------------------------------- */
+.card{
+  background:var(--surface);
+  border:1px solid var(--hair);
+  border-radius:var(--radius);
+  box-shadow:var(--shadow);
+  overflow:hidden;
+}
+.card .cap{
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+  font-size:15px; color:var(--muted);
+  padding:10px 16px; border-top:1px solid var(--hair);
+  background:#fff;
+}
+.figwrap{ display:block; }
+.figwrap .cap{ font-family:'JetBrains Mono', ui-monospace, monospace;
+  font-size:15px; color:var(--muted); margin-top:10px; }
+
+/* placeholder (photo/screenshot/video slots) */
+.ph{
+  position:relative; width:100%; height:100%;
+  display:flex; align-items:center; justify-content:center;
+  background:
+    repeating-linear-gradient(45deg, #fff 0 14px, #FCFCFE 14px 28px);
+  color:var(--muted);
+}
+.ph .tag{
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+  font-size:14px; text-align:center; padding:0 24px;
+  letter-spacing:.02em;
+}
+.ph .tag .lab{
+  display:inline-block; margin-bottom:8px; color:var(--accent);
+  border:1px solid var(--hair); border-radius:6px;
+  padding:3px 10px; background:#fff;
+}
+
+svg{ display:block; }
+.fig-svg{ width:100%; height:auto; }
+
+/* tables ---------------------------------------------------------- */
+table.clean{
+  width:100%; border-collapse:collapse; font-size:22px;
+}
+table.clean th{
+  text-align:left; font-weight:600; color:var(--muted);
+  font-size:16px; letter-spacing:.04em; text-transform:uppercase;
+  padding:0 14px 12px; border-bottom:1px solid var(--hair);
+}
+table.clean td{
+  padding:14px 14px; border-bottom:1px solid var(--hair);
+  vertical-align:top; line-height:1.35;
+}
+table.clean td.m, table.clean td .m{
+  font-family:'JetBrains Mono', ui-monospace, monospace; font-size:19px;
+}
+table.clean tr:last-child td{ border-bottom:none; }
+
+/* decorative pale shapes ------------------------------------------ */
+.blob{ position:absolute; background:var(--tint); z-index:0; pointer-events:none; }
+.blob.qc-tr{ width:420px; height:420px; right:-150px; top:-150px;
+  border-radius:0 0 0 100%; }
+.blob.qc-bl{ width:380px; height:380px; left:-140px; bottom:-140px;
+  border-radius:0 100% 0 0; }
+.blob.qc-br{ width:400px; height:400px; right:-150px; bottom:-150px;
+  border-radius:100% 0 0 0; }
+.blob.qc-tl{ width:380px; height:380px; left:-150px; top:-150px;
+  border-radius:0 0 100% 0; }
+.blob.soft{ border-radius:50%; filter:blur(2px); opacity:.7; }
+.dots{
+  position:absolute; z-index:0; pointer-events:none; opacity:.5;
+  background-image:radial-gradient(var(--hair) 1.4px, transparent 1.4px);
+  background-size:18px 18px;
+}
+.frame > .content{ position:relative; z-index:2; height:100%; }
+
+/* USI logo slot --------------------------------------------------- */
+.usi{
+  position:absolute; top:30px; right:36px; z-index:30;
+  height:36px; display:flex; align-items:center; gap:8px;
+}
+.usi .box{
+  height:36px; display:flex; align-items:center;
+  border:1px solid var(--hair); border-radius:7px;
+  padding:0 12px; background:#fff;
+}
+.usi .mark{
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+  font-weight:600; font-size:18px; color:var(--accent);
+  letter-spacing:.06em;
+}
+.usi .ph-note{
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+  font-size:9px; color:var(--muted); letter-spacing:.08em;
+  text-transform:uppercase;
+}
+/* white variant on dividers */
+.usi.white .box{ background:transparent; border-color:rgba(255,255,255,.55); }
+.usi.white .mark{ color:#fff; }
+.usi.white .ph-note{ color:rgba(255,255,255,.7); }
+
+/* footers --------------------------------------------------------- */
+.pageno, .talkfoot{
+  position:absolute; bottom:26px; z-index:30;
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+  font-size:14px; color:var(--muted); letter-spacing:.04em;
+}
+.pageno{ right:36px; }
+.talkfoot{ left:36px; }
+.divider .pageno, .divider .talkfoot{ color:rgba(255,255,255,.78); }
+.divider .talkfoot{ color:rgba(255,255,255,.78); }
+
+/* ===========================================================
+   TITLE SLIDE
+   =========================================================== */
+.title-slide{ position:absolute; inset:0; padding:64px; box-sizing:border-box;
+  display:flex; flex-direction:column; justify-content:flex-end; }
+.title-slide .hero{
+  position:absolute; inset:0; z-index:1;
+}
+.title-slide .scrim{
+  position:absolute; inset:0; z-index:2;
+  background:linear-gradient(180deg, rgba(251,251,253,0) 30%, rgba(251,251,253,.86) 72%, var(--bg) 100%);
+}
+.title-slide .ttext{ position:relative; z-index:3; max-width:1000px; }
+.title-slide h1{
+  font-size:60px; line-height:1.05; letter-spacing:-.02em; margin:0;
+}
+.title-slide .stack{
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+  font-size:18px; color:var(--accent); margin:18px 0 0; letter-spacing:.01em;
+}
+.title-slide .authors{ font-size:21px; color:var(--ink); margin:22px 0 0; font-weight:500; }
+.title-slide .course{ font-size:18px; color:var(--muted); margin:6px 0 0;
+  font-family:'JetBrains Mono', ui-monospace, monospace; }
+.usi.big{ height:80px; top:48px; right:48px; }
+.usi.big .box{ height:80px; padding:0 22px; border-radius:12px; }
+.usi.big .mark{ font-size:40px; }
+
+/* ===========================================================
+   DIVIDER SLIDES
+   =========================================================== */
+.divider{ position:absolute; inset:0; background:var(--accent);
+  display:flex; align-items:center; padding:64px; box-sizing:border-box; }
+.divider .bigshape{
+  position:absolute; width:620px; height:620px; border-radius:50%;
+  background:rgba(255,255,255,.07); right:-160px; bottom:-200px; z-index:1;
+}
+.divider .bigshape.two{ width:300px; height:300px; left:-90px; top:-90px;
+  border-radius:0 0 100% 0; background:rgba(255,255,255,.06); }
+.divider .dtext{ position:relative; z-index:3; }
+.divider .dnum{
+  font-family:'JetBrains Mono', ui-monospace, monospace;
+  font-size:22px; color:rgba(255,255,255,.75); letter-spacing:.12em;
+  margin:0 0 14px;
+}
+.divider h1{ color:#fff; font-size:56px; letter-spacing:-.01em; max-width:900px; }
+.divider .drule{ width:90px; height:3px; background:rgba(255,255,255,.85);
+  border-radius:2px; margin-top:22px; }
+
+/* FSM fragment highlight ------------------------------------------ */
+.reveal .fsm-node{ transition:all .2s ease; }
+.reveal .fragment.fsm-on.visible .fsm-rect{ fill:var(--accent); }
+.reveal .fragment.fsm-on.visible .fsm-label{ fill:#fff; }
+
+/* misc ------------------------------------------------------------ */
+.lead{ font-size:28px; line-height:1.45; color:var(--ink); max-width:560px; }
+.note{ font-size:18px; color:var(--muted); line-height:1.4; margin-top:14px;
+  font-family:'JetBrains Mono', ui-monospace, monospace; }
+.two-card{ display:grid; grid-template-columns:1fr 1fr; gap:18px; height:100%; }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+<!-- ============================ SLIDE 1 — TITLE (01/21) ============================ -->
+<section data-background-color="#FBFBFD">
+  <div class="title-slide">
+
+    <!-- hero: stylized isometric CoppeliaSim scene -->
+    <div class="hero">
+      <svg class="fig-svg" viewBox="0 0 1280 720" preserveAspectRatio="xMidYMid slice" style="height:100%;width:100%">
+        <defs>
+          <linearGradient id="heroSky" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stop-color="#F4FAFB"/><stop offset="1" stop-color="#FBFBFD"/>
+          </linearGradient>
+          <linearGradient id="floorG" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#EAF4F5"/><stop offset="1" stop-color="#F6FBFB"/>
+          </linearGradient>
+        </defs>
+        <rect width="1280" height="720" fill="url(#heroSky)"/>
+        <!-- isometric floor -->
+        <g transform="translate(640,300)">
+          <polygon points="0,40 360,230 0,420 -360,230" fill="url(#floorG)" stroke="#D7E8EA" stroke-width="2"/>
+          <!-- grid lines -->
+          <g stroke="#D7E8EA" stroke-width="1" opacity=".7">
+            <line x1="-240" y1="103" x2="120" y2="293"/>
+            <line x1="-120" y1="103" x2="240" y2="293"/>
+            <line x1="-240" y1="103" x2="-240" y2="103"/>
+            <line x1="240" y1="103" x2="-120" y2="293"/>
+            <line x1="120" y1="103" x2="-240" y2="293"/>
+          </g>
+          <!-- back walls -->
+          <polygon points="-360,230 0,40 0,-10 -360,180" fill="#FFFFFF" stroke="#E0ECEE" stroke-width="2"/>
+          <polygon points="360,230 0,40 0,-10 360,180" fill="#F3F8F9" stroke="#E0ECEE" stroke-width="2"/>
+          <!-- blue door on right wall -->
+          <polygon points="150,135 250,188 250,118 150,65" fill="#2E6BD6" opacity=".88"/>
+          <polygon points="150,135 250,188 250,178 150,125" fill="#1F50A8"/>
+          <!-- obstacles -->
+          <g>
+            <polygon points="-120,200 -60,232 -60,200 -120,168" fill="#EAF0F1" stroke="#D2E0E2"/>
+            <polygon points="-120,200 -120,168 -150,151 -150,183" fill="#DCE7E8" stroke="#D2E0E2"/>
+          </g>
+          <!-- green plate (flat) -->
+          <polygon points="40,250 110,290 40,330 -30,290" fill="#3AAE5E" opacity=".9"/>
+          <polygon points="40,258 96,290 40,322 -16,290" fill="#2E9E5B"/>
+          <!-- magenta key column -->
+          <g transform="translate(-110,260)">
+            <polygon points="0,0 14,8 14,-44 0,-52" fill="#A7237A"/>
+            <polygon points="0,0 -14,8 -14,-44 0,-52" fill="#C42A8E"/>
+            <polygon points="0,-52 14,-44 0,-36 -14,-44" fill="#D94FA8"/>
+          </g>
+          <!-- robot -->
+          <g transform="translate(-30,150)">
+            <polygon points="0,0 46,26 46,4 0,-22" fill="#3A3A42"/>
+            <polygon points="0,0 -46,26 -46,4 0,-22" fill="#26262C"/>
+            <polygon points="0,-22 46,4 0,30 -46,4" fill="#52525C"/>
+            <!-- gripper arm -->
+            <polygon points="0,30 22,42 22,30 0,18" fill="#0E7C86"/>
+            <circle cx="6" cy="-6" r="4" fill="#0E7C86"/>
+          </g>
+        </g>
+      </svg>
+    </div>
+
+    <div class="scrim"></div>
+
+    <!-- big USI logo placeholder top-right -->
+    <div class="usi big"><div class="box"><span class="mark">USI</span></div></div>
+
+    <div class="ttext">
+      <h1>Autonomous Escape Room<br><span style="font-size:.6em;color:var(--muted);font-weight:400">mapping &amp; grasping without ground-truth</span></h1>
+      <div class="stack">RoboMaster EP · CoppeliaSim · ROS 2 (Nav2 + slam_toolbox)</div>
+      <div class="authors">Gianluca Viviano · Sara Mashhadi Alizadeh · Etienne Orio</div>
+      <div class="course">Robotics course, USI — 2026</div>
+    </div>
+    <div class="pageno">01 / 21</div>
+  </div>
+</section>
+
+<!-- ============================ SLIDE 2 — THE MISSION (02/21) ============================ -->
+<section>
+  <div class="frame">
+    <div class="blob qc-tr"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="split v55">
+        <div class="textcol">
+          <div class="titlebar"><h1>The mission</h1><div class="rule"></div></div>
+          <ul>
+            <li>Locked in a room; a <span style="color:#2E6BD6;font-weight:600">blue door</span> is held shut.</li>
+            <li>Find the <span style="color:#C42A8E;font-weight:600">key</span> → carry it onto the <span class="ok">green plate</span> → the door opens.</li>
+            <li>The robot never drives to the door; the <span class="key">plate</span> triggers it.</li>
+            <li>Hard constraint: <span class="key">no simulator coordinates</span> — only LiDAR, RGB, odometry.</li>
+          </ul>
+        </div>
+        <div class="viscol">
+          <div class="card figwrap">
+            <svg class="fig-svg" viewBox="0 0 600 420">
+      <rect width="600" height="420" fill="#fff"/>
+      <!-- room walls -->
+      <rect x="60" y="50" width="480" height="320" rx="4" fill="#FBFDFD" stroke="#1B1B1F" stroke-width="6"/>
+      <!-- blue door gap on right wall -->
+      <rect x="534" y="150" width="12" height="110" fill="#fff"/>
+      <rect x="540" y="150" width="8" height="110" fill="#2E6BD6"/>
+      <line x1="548" y1="150" x2="600" y2="120" stroke="#2E6BD6" stroke-width="2" stroke-dasharray="4 4"/>
+      <!-- obstacles -->
+      <rect x="300" y="90" width="64" height="44" rx="4" fill="#EAF0F1" stroke="#D2E0E2" stroke-width="2"/>
+      <rect x="380" y="250" width="52" height="52" rx="4" fill="#EAF0F1" stroke="#D2E0E2" stroke-width="2"/>
+      <rect x="150" y="300" width="60" height="40" rx="4" fill="#EAF0F1" stroke="#D2E0E2" stroke-width="2"/>
+      <!-- green plate (flat square) -->
+      <rect x="330" y="276" width="86" height="86" rx="6" fill="#3AAE5E" opacity=".25" stroke="#2E9E5B" stroke-width="2.5"/>
+      <rect x="350" y="296" width="46" height="46" rx="3" fill="#2E9E5B" opacity=".5"/>
+      <!-- magenta key column (top-down small square) -->
+      <rect x="106" y="226" width="24" height="24" rx="3" fill="#C42A8E"/>
+      <circle cx="118" cy="238" r="20" fill="none" stroke="#C42A8E" stroke-width="1.5" stroke-dasharray="3 4" opacity=".6"/>
+      <!-- robot -->
+      <g transform="translate(232,150)">
+        <rect x="-26" y="-22" width="52" height="44" rx="7" fill="#3A3A42"/>
+        <rect x="-10" y="-34" width="20" height="14" rx="3" fill="#0E7C86"/>
+        <circle cx="0" cy="0" r="6" fill="#52525C"/>
+        <line x1="0" y1="0" x2="40" y2="-30" stroke="#0E7C86" stroke-width="2" stroke-dasharray="3 4"/>
+      </g>
+    </svg>
+            <div class="cap">Top-down room — robot, key, plate &amp; door</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">02 / 21</div>
+  </div>
+</section>
+
+<!-- ============================ SLIDE 3 — WHY NON-TRIVIAL (03/21) ============================ -->
+<section>
+  <div class="frame">
+    <div class="blob qc-bl"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="split v55-left">
+        <div class="viscol">
+          <div class="card figwrap">
+            <svg class="fig-svg" viewBox="0 0 560 420">
+              <rect width="560" height="420" fill="#fff"/>
+              <!-- camera frustum losing the column -->
+              <g transform="translate(70,60)">
+                <polygon points="0,150 0,60 360,0 360,330" fill="#EAF4F5" opacity=".7"/>
+                <text x="6" y="46" font-family="JetBrains Mono,monospace" font-size="14" fill="#6B6B73">camera FOV</text>
+                <!-- the thin magenta column near the camera, base clipping below frustum bottom -->
+                <rect x="40" y="120" width="14" height="150" fill="#C42A8E"/>
+                <line x1="40" y1="210" x2="40" y2="300" stroke="#C42A8E" stroke-width="2" stroke-dasharray="5 5"/>
+                <text x="2" y="320" font-family="JetBrains Mono,monospace" font-size="13" fill="#C42A8E">base clips out of frame</text>
+                <!-- nav tolerance ring vs 3cm cube -->
+                <g transform="translate(250,200)">
+                  <circle r="78" fill="none" stroke="#6B6B73" stroke-width="2" stroke-dasharray="4 5"/>
+                  <text x="-46" y="-86" font-family="JetBrains Mono,monospace" font-size="13" fill="#6B6B73">~25 cm nav tol.</text>
+                  <rect x="-7" y="-7" width="14" height="14" fill="#C42A8E"/>
+                  <text x="14" y="4" font-family="JetBrains Mono,monospace" font-size="13" fill="#1B1B1F">3×3 cm</text>
+                </g>
+              </g>
+            </svg>
+            <div class="cap">Tolerance dwarfs the target; depth fails up close</div>
+          </div>
+        </div>
+        <div class="textcol">
+          <div class="titlebar"><h1>Why it is non-trivial</h1><div class="rule"></div></div>
+          <ul>
+            <li>Robot does not know where things are → it must <span class="key">explore &amp; map</span>.</li>
+            <li>Landmarks <span class="key">perceived from the camera</span>, not queried.</li>
+            <li>Key is a thin <span class="pill">3×3 cm</span> column → ~25 cm nav tolerance is far too coarse.</li>
+            <li>Monocular depth breaks at close range.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">03 / 21</div>
+  </div>
+</section>
+
+<!-- ============================ SLIDE 4 — THE SCENARIO (04/21) ============================ -->
+<section>
+  <div class="frame">
+    <div class="blob qc-tr"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="split v55">
+        <div class="textcol">
+          <div class="titlebar"><h1>The scenario</h1><div class="rule"></div></div>
+          <ul>
+            <li>Room <span class="pill">5 × 4 m</span>, 5 cm walls, 3 obstacles <span class="pill">easy.json</span>.</li>
+            <li><span style="color:#C42A8E;font-weight:600">Key</span> — magenta ~280–340°, 0.03×0.03×0.20 m.</li>
+            <li><span class="ok">Plate</span> — green 80–160°, 0.30×0.30 m, flat.</li>
+            <li><span style="color:#2E6BD6;font-weight:600">Door</span> — blue 200–260°.</li>
+          </ul>
+          <div class="note">Magenta avoids red (floor/wall) &amp; yellow (floor pattern).</div>
+        </div>
+        <div class="viscol">
+          <div class="card figwrap">
+            <svg class="fig-svg" viewBox="0 0 600 420">
+      <rect width="600" height="420" fill="#fff"/>
+      <!-- room walls -->
+      <rect x="60" y="50" width="480" height="320" rx="4" fill="#FBFDFD" stroke="#1B1B1F" stroke-width="6"/>
+      <!-- blue door gap on right wall -->
+      <rect x="534" y="150" width="12" height="110" fill="#fff"/>
+      <rect x="540" y="150" width="8" height="110" fill="#2E6BD6"/>
+      <line x1="548" y1="150" x2="600" y2="120" stroke="#2E6BD6" stroke-width="2" stroke-dasharray="4 4"/>
+      <!-- obstacles -->
+      <rect x="300" y="90" width="64" height="44" rx="4" fill="#EAF0F1" stroke="#D2E0E2" stroke-width="2"/>
+      <rect x="380" y="250" width="52" height="52" rx="4" fill="#EAF0F1" stroke="#D2E0E2" stroke-width="2"/>
+      <rect x="150" y="300" width="60" height="40" rx="4" fill="#EAF0F1" stroke="#D2E0E2" stroke-width="2"/>
+      <!-- green plate (flat square) -->
+      <rect x="330" y="276" width="86" height="86" rx="6" fill="#3AAE5E" opacity=".25" stroke="#2E9E5B" stroke-width="2.5"/>
+      <rect x="350" y="296" width="46" height="46" rx="3" fill="#2E9E5B" opacity=".5"/>
+      <!-- magenta key column (top-down small square) -->
+      <rect x="106" y="226" width="24" height="24" rx="3" fill="#C42A8E"/>
+      <circle cx="118" cy="238" r="20" fill="none" stroke="#C42A8E" stroke-width="1.5" stroke-dasharray="3 4" opacity=".6"/>
+      <!-- robot -->
+      <g transform="translate(232,150)">
+        <rect x="-26" y="-22" width="52" height="44" rx="7" fill="#3A3A42"/>
+        <rect x="-10" y="-34" width="20" height="14" rx="3" fill="#0E7C86"/>
+        <circle cx="0" cy="0" r="6" fill="#52525C"/>
+        <line x1="0" y1="0" x2="40" y2="-30" stroke="#0E7C86" stroke-width="2" stroke-dasharray="3 4"/>
+      </g>
+      <text x="300" y="34" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="15" fill="#6B6B73">5 × 4 m room</text>
+      <text x="118" y="250" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" fill="#C42A8E">key 3×3×20cm</text>
+      <text x="372" y="318" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" fill="#2E9E5B">plate 30×30</text>
+      <text x="556" y="150" text-anchor="end" font-family="JetBrains Mono,monospace" font-size="13" fill="#2E6BD6">blue door</text>
+      <text x="232" y="170" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" fill="#6B6B73">robot</text>
+    </svg>
+            <div class="cap">Labelled positions &amp; HSV-distinct landmarks</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">04 / 21</div>
+  </div>
+</section>
+
+<!-- ============================ SLIDE 5 — ARCHITECTURE (05/21) ============================ -->
+<section>
+  <div class="frame">
+    <div class="blob qc-br"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="titlebar"><h1>System architecture</h1><div class="rule"></div></div>
+      <div style="display:grid;grid-template-columns:34% 1fr;gap:36px;align-items:center;height:calc(100% - 80px)">
+        <ul style="align-self:center">
+          <li><span class="pill">CoppeliaSim</span> ↔ <span class="pill">ROS 2</span> bridged by robomaster_sim/_ros.</li>
+          <li>Nav stack: <span class="key">slam_toolbox</span> + <span class="key">Nav2</span>.</li>
+          <li>Scene built from JSON over <span class="pill">ZMQ</span> (build_scene.py).</li>
+        </ul>
+        <div class="card figwrap" style="align-self:center">
+          <svg class="fig-svg" viewBox="0 0 760 380">
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#0E7C86"/>
+    </marker>
+  </defs>
+  <rect width="760" height="380" fill="#fff"/>
+  <!-- Sim box -->
+  <rect x="36" y="120" width="180" height="140" rx="12" fill="#EAF4F5" stroke="#0E7C86" stroke-width="2"/>
+  <text x="126" y="150" text-anchor="middle" font-family="Inter,sans-serif" font-weight="600" font-size="18" fill="#1B1B1F">CoppeliaSim</text>
+  <text x="126" y="174" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" fill="#6B6B73">physics</text>
+  <text x="126" y="216" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" fill="#6B6B73">build_scene.py</text>
+  <text x="126" y="234" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" fill="#6B6B73">lidar_sensor.lua</text>
+  <!-- bridge -->
+  <rect x="280" y="150" width="150" height="80" rx="10" fill="#fff" stroke="#E6E6EA" stroke-width="2"/>
+  <text x="355" y="184" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" fill="#1B1B1F">robomaster_sim</text>
+  <text x="355" y="206" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" fill="#1B1B1F">robomaster_ros</text>
+  <!-- ROS nodes column -->
+  <rect x="500" y="36" width="224" height="80" rx="10" fill="#fff" stroke="#E6E6EA" stroke-width="2"/>
+  <text x="612" y="64" text-anchor="middle" font-family="Inter,sans-serif" font-weight="600" font-size="16" fill="#1B1B1F">slam_toolbox</text>
+  <text x="612" y="90" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" fill="#6B6B73">/map · map→odom</text>
+  <rect x="500" y="132" width="224" height="80" rx="10" fill="#fff" stroke="#E6E6EA" stroke-width="2"/>
+  <text x="612" y="160" text-anchor="middle" font-family="Inter,sans-serif" font-weight="600" font-size="16" fill="#1B1B1F">Nav2</text>
+  <text x="612" y="186" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" fill="#6B6B73">planning · control</text>
+  <rect x="500" y="228" width="224" height="80" rx="10" fill="#EAF4F5" stroke="#0E7C86" stroke-width="2"/>
+  <text x="612" y="256" text-anchor="middle" font-family="Inter,sans-serif" font-weight="600" font-size="16" fill="#0E7C86">explorer_node (FSM)</text>
+  <text x="612" y="282" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" fill="#6B6B73">color_detector_node</text>
+  <!-- arrows -->
+  <line x1="216" y1="190" x2="278" y2="190" stroke="#0E7C86" stroke-width="2.2" marker-end="url(#ah)"/>
+  <line x1="430" y1="172" x2="498" y2="76" stroke="#0E7C86" stroke-width="2.2" marker-end="url(#ah)"/>
+  <line x1="430" y1="190" x2="498" y2="172" stroke="#0E7C86" stroke-width="2.2" marker-end="url(#ah)"/>
+  <line x1="430" y1="208" x2="498" y2="268" stroke="#0E7C86" stroke-width="2.2" marker-end="url(#ah)"/>
+  <text x="250" y="180" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="11" fill="#6B6B73">topics</text>
+  <!-- ZMQ side channel -->
+  <path d="M126,260 C126,330 612,338 612,310" fill="none" stroke="#C42A8E" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#ah)"/>
+  <text x="370" y="356" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" fill="#C42A8E">ZMQ side-channel · gripper / door</text>
+</svg>
+          <div class="cap">Sim → ROS topics → nodes → Sim; ZMQ side-channel</div>
+        </div>
+      </div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">05 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== DIVIDER 01 (06/21) ===================== -->
+<section class="divider-wrap" data-background-color="#0E7C86">
+  <div class="divider">
+    <div class="bigshape"></div><div class="bigshape two"></div>
+    <div class="usi white"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="dtext">
+      <div class="dnum">01</div>
+      <h1>Perception &amp; Mapping</h1>
+      <div class="drule"></div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">06 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== SLIDE 6 — SENSING PIPELINE (07/21) ===================== -->
+<section>
+  <div class="frame">
+    <div class="blob qc-tr"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="titlebar"><h1>Sensing pipeline</h1><div class="rule"></div></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:40px;height:calc(100% - 86px);align-items:center">
+        <ul style="align-self:center">
+          <li>Ray sensor (Lua) → <span class="pill">/scan</span> @ 10 Hz — hit distance, not positions.</li>
+          <li>Encoders → <span class="pill">/odom</span> + odom→base_link TF.</li>
+          <li>Camera → <span class="pill">/camera/image_color</span>.</li>
+          <li>Obstacles mapped by <span class="key">SLAM from sensor data</span>.</li>
+        </ul>
+        <div class="card" style="align-self:center;padding:26px 28px 18px">
+          <table class="clean">
+            <thead><tr><th>Source</th><th>Topic</th><th>Message</th></tr></thead>
+            <tbody>
+              <tr><td>Ray proximity</td><td class="m">/scan</td><td class="m">LaserScan</td></tr>
+              <tr><td>Wheel encoders</td><td class="m">/odom</td><td class="m">Odometry</td></tr>
+              <tr><td>Camera</td><td class="m">/camera/image_color</td><td class="m">Image</td></tr>
+            </tbody>
+          </table>
+          <div class="cap" style="border-top:1px solid var(--hair);margin:16px -28px -18px;padding:10px 28px">Sensor sources → ROS topics</div>
+        </div>
+      </div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">07 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== SLIDE 7 — SLAM & LOCALISATION (08/21) ===================== -->
+<section>
+  <div class="frame">
+    <div class="blob qc-bl"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="split v55">
+        <div class="textcol">
+          <div class="titlebar"><h1>SLAM &amp; localisation</h1><div class="rule"></div></div>
+          <ul>
+            <li><span class="pill">slam_toolbox</span> builds a 2D occupancy grid → <span class="pill">/map</span>.</li>
+            <li>Provides the <span class="key">map → odom</span> transform.</li>
+            <li>TF: <span class="mono" style="font-size:.8em">map→odom→base_link→camera_optical_link</span>.</li>
+            <li>FSM reads pose from <span class="key">TF</span>, never from the sim.</li>
+          </ul>
+        </div>
+        <div class="viscol">
+          <div class="card figwrap">
+            <svg class="fig-svg" viewBox="0 0 600 420">
+  <rect width="600" height="420" fill="#2b2b30"/>
+  <!-- unknown = mid grey field; build occupancy look -->
+  <g>
+    <rect x="40" y="40" width="520" height="340" fill="#3a3a42"/>
+    <!-- free space -->
+    <path d="M120,110 L470,110 L470,310 L120,310 Z" fill="#d9d9de"/>
+    <path d="M150,140 L300,140 L300,200 L240,200 L240,280 L150,280 Z" fill="#ececf0"/>
+    <!-- occupied walls (black) -->
+    <rect x="118" y="108" width="354" height="8" fill="#111"/>
+    <rect x="118" y="304" width="354" height="8" fill="#111"/>
+    <rect x="118" y="108" width="8" height="204" fill="#111"/>
+    <rect x="464" y="108" width="8" height="60" fill="#111"/>
+    <rect x="464" y="240" width="8" height="72" fill="#111"/>
+    <!-- obstacle blobs -->
+    <rect x="320" y="150" width="46" height="34" fill="#111"/>
+    <rect x="350" y="250" width="40" height="40" fill="#111"/>
+    <!-- robot pose arrow -->
+    <g transform="translate(200,230)">
+      <circle r="9" fill="#0E7C86"/>
+      <path d="M0,-3 L26,-3 L26,-9 L40,0 L26,9 L26,3 L0,3 Z" fill="#0E7C86"/>
+    </g>
+    <!-- partial / building edge -->
+    <path d="M470,110 L520,90" stroke="#888" stroke-width="3" stroke-dasharray="4 4"/>
+  </g>
+  <text x="56" y="402" font-family="JetBrains Mono,monospace" font-size="13" fill="#9a9aa2">/map · occupancy grid</text>
+</svg>
+            <div class="cap">RViz — occupancy map mid-build  ·  replace with screenshot</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">08 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== SLIDE 8 — LANDMARK PERCEPTION (09/21) ===================== -->
+<section>
+  <div class="frame">
+    <div class="blob qc-tr"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="split v55">
+        <div class="textcol">
+          <div class="titlebar"><h1>Landmark perception</h1><div class="rule"></div>
+            <div class="note" style="margin-top:8px">color_detector_node</div></div>
+          <ul>
+            <li>Image → <span class="key">HSV mask</span> → blob → <span class="pill">PoseStamped</span> (map).</li>
+            <li>Cube &amp; door: monocular depth from known height.</li>
+            <li>Plate: centroid ray × floor plane.</li>
+            <li>Latched targets, refined <span class="key">every frame</span> while visible.</li>
+          </ul>
+        </div>
+        <div class="viscol">
+          <div class="card figwrap">
+            <svg class="fig-svg" viewBox="0 0 600 420">
+  <rect width="600" height="420" fill="#fff"/>
+  <!-- left: RGB camera frame -->
+  <g>
+    <rect x="20" y="30" width="270" height="300" rx="8" fill="#dfeef0"/>
+    <rect x="20" y="30" width="270" height="300" rx="8" fill="none" stroke="#E6E6EA"/>
+    <rect x="20" y="240" width="270" height="90" rx="0" fill="#cfe2e4"/>
+    <!-- magenta column -->
+    <rect x="120" y="120" width="20" height="130" fill="#C42A8E"/>
+    <!-- green plate hint -->
+    <ellipse cx="210" cy="265" rx="48" ry="16" fill="#3AAE5E" opacity=".7"/>
+    <text x="155" y="356" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="14" fill="#6B6B73">RGB frame</text>
+  </g>
+  <!-- arrow -->
+  <path d="M300,180 L322,180" stroke="#0E7C86" stroke-width="3"/>
+  <path d="M318,172 L332,180 L318,188 Z" fill="#0E7C86"/>
+  <!-- right: HSV mask (binary) -->
+  <g>
+    <rect x="335" y="30" width="245" height="300" rx="8" fill="#0c0c10"/>
+    <rect x="335" y="30" width="245" height="300" rx="8" fill="none" stroke="#E6E6EA"/>
+    <!-- isolated magenta blob -->
+    <rect x="420" y="120" width="22" height="132" fill="#C42A8E"/>
+    <rect x="412" y="112" width="38" height="148" fill="none" stroke="#fff" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <circle cx="431" cy="186" r="3" fill="#fff"/>
+    <text x="457" y="356" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="14" fill="#6B6B73">HSV mask → blob</text>
+  </g>
+</svg>
+            <div class="cap">Camera frame + HSV mask  ·  replace with capture</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">09 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== DIVIDER 02 (10/21) ===================== -->
+<section data-background-color="#0E7C86">
+  <div class="divider">
+    <div class="bigshape"></div><div class="bigshape two"></div>
+    <div class="usi white"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="dtext">
+      <div class="dnum">02</div>
+      <h1>The Mission FSM</h1>
+      <div class="drule"></div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">10 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== SLIDE 9 — MISSION FSM (11/21) ===================== -->
+<section>
+  <div class="frame">
+    <div class="blob qc-br"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="titlebar"><h1>Mission FSM</h1><div class="rule"></div>
+        <div class="note" style="margin-top:8px">explorer_node · one tick-method per state · 4 Hz</div></div>
+      <div class="card figwrap" style="margin-top:18px">
+        <svg class="fig-svg" viewBox="0 0 1144 300">
+  <defs><marker id="fa" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#6B6B73"/></marker></defs>
+  <rect width="1144" height="300" fill="#fff"/>
+  <line x1="220" y1="56.0" x2="244" y2="56.0" stroke="#6B6B73" stroke-width="2" marker-end="url(#fa)"/><line x1="444" y1="56.0" x2="468" y2="56.0" stroke="#6B6B73" stroke-width="2" marker-end="url(#fa)"/><line x1="668" y1="56.0" x2="692" y2="56.0" stroke="#6B6B73" stroke-width="2" marker-end="url(#fa)"/><line x1="892" y1="56.0" x2="916" y2="56.0" stroke="#6B6B73" stroke-width="2" marker-end="url(#fa)"/><path d="M1016.0,88 C1016.0,118 1016.0,124 1016.0,154" fill="none" stroke="#6B6B73" stroke-width="2" marker-end="url(#fa)"/><line x1="916" y1="186.0" x2="892" y2="186.0" stroke="#6B6B73" stroke-width="2" marker-end="url(#fa)"/><line x1="692" y1="186.0" x2="668" y2="186.0" stroke="#6B6B73" stroke-width="2" marker-end="url(#fa)"/><line x1="468" y1="186.0" x2="444" y2="186.0" stroke="#6B6B73" stroke-width="2" marker-end="url(#fa)"/><line x1="244" y1="186.0" x2="220" y2="186.0" stroke="#6B6B73" stroke-width="2" marker-end="url(#fa)"/>
+  <g class="fragment fsm-on" data-fragment-index="0">
+        <rect class="fsm-rect" x="20" y="24" width="200" height="64" rx="10" fill="#fff" stroke="#0E7C86" stroke-width="2"/>
+        <text class="fsm-label" x="120.0" y="61.0" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="16" fill="#1B1B1F">EXPLORE</text>
+      </g><g class="fragment fsm-on" data-fragment-index="1">
+        <rect class="fsm-rect" x="244" y="24" width="200" height="64" rx="10" fill="#EAF4F5" stroke="#0E7C86" stroke-width="2"/>
+        <text class="fsm-label" x="344.0" y="61.0" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="16" fill="#1B1B1F">GO_TO_KEY</text>
+      </g><g class="fragment fsm-on" data-fragment-index="2">
+        <rect class="fsm-rect" x="468" y="24" width="200" height="64" rx="10" fill="#EAF4F5" stroke="#0E7C86" stroke-width="2"/>
+        <text class="fsm-label" x="568.0" y="61.0" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="16" fill="#1B1B1F">PICKUP_OPEN</text>
+      </g><g class="fragment fsm-on" data-fragment-index="3">
+        <rect class="fsm-rect" x="692" y="24" width="200" height="64" rx="10" fill="#EAF4F5" stroke="#0E7C86" stroke-width="2"/>
+        <text class="fsm-label" x="792.0" y="61.0" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="16" fill="#1B1B1F">PICKUP_ALIGN</text>
+      </g><g class="fragment fsm-on" data-fragment-index="4">
+        <rect class="fsm-rect" x="916" y="24" width="200" height="64" rx="10" fill="#EAF4F5" stroke="#0E7C86" stroke-width="2"/>
+        <text class="fsm-label" x="1016.0" y="61.0" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="16" fill="#1B1B1F">PICKUP_CLOSE</text>
+      </g><g class="fragment fsm-on" data-fragment-index="5">
+        <rect class="fsm-rect" x="916" y="154" width="200" height="64" rx="10" fill="#EAF4F5" stroke="#0E7C86" stroke-width="2"/>
+        <text class="fsm-label" x="1016.0" y="191.0" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="16" fill="#1B1B1F">GO_TO_PLATE</text>
+      </g><g class="fragment fsm-on" data-fragment-index="6">
+        <rect class="fsm-rect" x="692" y="154" width="200" height="64" rx="10" fill="#EAF4F5" stroke="#0E7C86" stroke-width="2"/>
+        <text class="fsm-label" x="792.0" y="191.0" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="16" fill="#1B1B1F">DROP_ALIGN</text>
+      </g><g class="fragment fsm-on" data-fragment-index="7">
+        <rect class="fsm-rect" x="468" y="154" width="200" height="64" rx="10" fill="#EAF4F5" stroke="#0E7C86" stroke-width="2"/>
+        <text class="fsm-label" x="568.0" y="191.0" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="16" fill="#1B1B1F">DROP_OPEN</text>
+      </g><g class="fragment fsm-on" data-fragment-index="8">
+        <rect class="fsm-rect" x="244" y="154" width="200" height="64" rx="10" fill="#EAF4F5" stroke="#0E7C86" stroke-width="2"/>
+        <text class="fsm-label" x="344.0" y="191.0" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="16" fill="#1B1B1F">DROP_BACKUP</text>
+      </g><g class="fragment fsm-on" data-fragment-index="9">
+        <rect class="fsm-rect" x="20" y="154" width="200" height="64" rx="10" fill="#fff" stroke="#0E7C86" stroke-width="2"/>
+        <text class="fsm-label" x="120.0" y="191.0" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="16" fill="#1B1B1F">DONE</text>
+      </g>
+</svg>
+        <div class="cap">Nav2 = long-range driving · cmd_vel = short precise moves · starts when server + map + TF ready</div>
+      </div>
+      <ul style="margin-top:18px">
+        <li><span class="key">Nav2</span> drives far; <span class="pill">cmd_vel</span> finishes precise.</li>
+      </ul>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">11 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== SLIDE 10 — FRONTIER EXPLORATION (12/21) ===================== -->
+<section>
+  <div class="frame">
+    <div class="blob qc-bl"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="split v55">
+        <div class="textcol">
+          <div class="titlebar"><h1>Phase 1: Frontier exploration</h1><div class="rule"></div></div>
+          <ul>
+            <li><span class="key">Frontiers</span> = known-free ↔ unknown boundary cells.</li>
+            <li>Nav2 goal to the <span class="key">nearest</span> frontier, facing it.</li>
+            <li>Retry on Nav2 abort (fails near walls).</li>
+            <li>Exit: all <span class="pill">3 landmarks</span> found → GO_TO_KEY.</li>
+          </ul>
+        </div>
+        <div class="viscol">
+          <div class="card figwrap">
+            <svg class="fig-svg" viewBox="0 0 600 420">
+  <rect width="600" height="420" fill="#2b2b30"/>
+  <rect x="40" y="40" width="520" height="340" fill="#3a3a42"/>
+  <!-- known free -->
+  <path d="M120,110 L420,110 L420,300 L120,300 Z" fill="#d9d9de"/>
+  <!-- walls -->
+  <rect x="118" y="108" width="304" height="8" fill="#111"/>
+  <rect x="118" y="108" width="8" height="200" fill="#111"/>
+  <rect x="118" y="300" width="304" height="8" fill="#111"/>
+  <!-- frontier cells (accent violet) at the unknown boundary -->
+  <g fill="#7A4DD8">
+    <rect x="420" y="120" width="12" height="12"/><rect x="420" y="140" width="12" height="12"/>
+    <rect x="420" y="160" width="12" height="12"/><rect x="420" y="180" width="12" height="12"/>
+    <rect x="420" y="200" width="12" height="12"/><rect x="420" y="220" width="12" height="12"/>
+    <rect x="420" y="240" width="12" height="12"/><rect x="420" y="260" width="12" height="12"/>
+    <rect x="420" y="280" width="12" height="12"/>
+  </g>
+  <!-- robot -->
+  <g transform="translate(200,210)"><circle r="9" fill="#0E7C86"/>
+    <path d="M0,-3 L24,-3 L24,-9 L38,0 L24,9 L24,3 L0,3 Z" fill="#0E7C86"/></g>
+  <!-- goal arrow to nearest frontier -->
+  <line x1="215" y1="210" x2="412" y2="206" stroke="#0E7C86" stroke-width="2" stroke-dasharray="6 5"/>
+  <text x="448" y="206" font-family="JetBrains Mono,monospace" font-size="13" fill="#7A4DD8">frontier</text>
+  <text x="56" y="402" font-family="JetBrains Mono,monospace" font-size="13" fill="#9a9aa2">nearest frontier · facing it</text>
+</svg>
+            <div class="cap">Occupancy map — frontier cells highlighted</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">12 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== DIVIDER 03 (13/21) ===================== -->
+<section data-background-color="#0E7C86">
+  <div class="divider">
+    <div class="bigshape"></div><div class="bigshape two"></div>
+    <div class="usi white"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="dtext">
+      <div class="dnum">03</div>
+      <h1>Manipulation</h1>
+      <div class="drule"></div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">13 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== SLIDE 11 — APPROACH THE KEY (14/21) ===================== -->
+<section>
+  <div class="frame">
+    <div class="blob qc-tr"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="split v55">
+        <div class="textcol">
+          <div class="titlebar"><h1>Phase 2: Approach the key</h1><div class="rule"></div></div>
+          <ul>
+            <li><span class="pill">GO_TO_KEY</span>: Nav2 goal <span class="key">0.90 m short</span>, facing the cube.</li>
+            <li><span class="pill">PICKUP_OPEN</span>: open gripper early.</li>
+            <li><span class="pill">PICKUP_ALIGN</span>: <span class="key">closed-loop visual servoing</span> on the live bearing.</li>
+            <li>No ground-truth cube coordinate is ever used.</li>
+          </ul>
+        </div>
+        <div class="viscol">
+          <div class="card figwrap">
+            <svg class="fig-svg" viewBox="0 0 600 420">
+  <rect width="600" height="420" fill="#F4FAFB"/>
+  <rect x="0" y="300" width="600" height="120" fill="#EAF4F5"/>
+  <!-- bearing/centering crosshair -->
+  <line x1="300" y1="40" x2="300" y2="360" stroke="#0E7C86" stroke-width="1.5" stroke-dasharray="5 6" opacity=".6"/>
+  <text x="306" y="58" font-family="JetBrains Mono,monospace" font-size="13" fill="#0E7C86">centre bearing</text>
+  <!-- magenta key column -->
+  <g transform="translate(300,210)">
+    <rect x="-9" y="0" width="18" height="120" fill="#C42A8E"/>
+    <ellipse cx="0" cy="122" rx="20" ry="6" fill="#C42A8E" opacity=".25"/>
+  </g>
+  <!-- robot approaching from left with open gripper -->
+  <g transform="translate(150,250)">
+    <rect x="-44" y="-30" width="88" height="60" rx="10" fill="#3A3A42"/>
+    <circle cx="-22" cy="34" r="14" fill="#26262C"/><circle cx="22" cy="34" r="14" fill="#26262C"/>
+    <!-- open gripper jaws reaching right -->
+    <rect x="44" y="-20" width="46" height="8" rx="3" fill="#0E7C86"/>
+    <rect x="44" y="12" width="46" height="8" rx="3" fill="#0E7C86"/>
+    <rect x="44" y="-20" width="8" height="40" rx="3" fill="#0E7C86"/>
+  </g>
+  <!-- yaw P-control arc -->
+  <path d="M232,250 A70,70 0 0 1 250,196" fill="none" stroke="#0E7C86" stroke-width="2" marker-end="url(#ah2)"/>
+  <defs><marker id="ah2" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#0E7C86"/></marker></defs>
+  <text x="60" y="402" font-family="JetBrains Mono,monospace" font-size="13" fill="#6B6B73">yaw P-control, tol 0.08 rad</text>
+</svg>
+            <div class="cap">Visual servoing — centre, then drive  ·  replace with capture</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">14 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== SLIDE 12 — THE LUNGE (15/21) ===================== -->
+<section>
+  <div class="frame">
+    <div class="blob qc-bl"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="split v55-left">
+        <div class="viscol">
+          <div class="card figwrap">
+            <svg class="fig-svg" viewBox="0 0 600 420">
+  <rect width="600" height="420" fill="#F4FAFB"/>
+  <rect x="0" y="300" width="600" height="120" fill="#EAF4F5"/>
+  <!-- target column -->
+  <g transform="translate(470,200)"><rect x="-9" y="0" width="18" height="120" fill="#C42A8E"/></g>
+  <!-- closed-loop region (faded) -->
+  <rect x="60" y="170" width="300" height="180" fill="#0E7C86" opacity=".06"/>
+  <text x="210" y="160" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" fill="#0E7C86">closed-loop (visible)</text>
+  <!-- open-loop lunge region -->
+  <rect x="360" y="170" width="130" height="180" fill="#C42A8E" opacity=".08"/>
+  <text x="424" y="160" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" fill="#C42A8E">open-loop lunge</text>
+  <!-- distance markers -->
+  <line x1="360" y1="332" x2="461" y2="332" stroke="#6B6B73" stroke-width="1.5"/>
+  <line x1="360" y1="326" x2="360" y2="338" stroke="#6B6B73" stroke-width="1.5"/>
+  <line x1="461" y1="326" x2="461" y2="338" stroke="#6B6B73" stroke-width="1.5"/>
+  <text x="410" y="354" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" fill="#6B6B73">freeze ~0.90 m</text>
+  <line x1="461" y1="200" x2="461" y2="320" stroke="#2E9E5B" stroke-width="1.5" stroke-dasharray="3 3"/>
+  <text x="500" y="206" font-family="JetBrains Mono,monospace" font-size="12" fill="#2E9E5B">stop 0.03 m short</text>
+  <!-- robot -->
+  <g transform="translate(150,250)">
+    <rect x="-44" y="-30" width="88" height="60" rx="10" fill="#3A3A42"/>
+    <circle cx="-22" cy="34" r="14" fill="#26262C"/><circle cx="22" cy="34" r="14" fill="#26262C"/>
+    <rect x="44" y="-14" width="30" height="8" rx="3" fill="#0E7C86"/>
+    <rect x="44" y="6" width="30" height="8" rx="3" fill="#0E7C86"/>
+  </g>
+  <line x1="200" y1="250" x2="445" y2="250" stroke="#1B1B1F" stroke-width="2" marker-end="url(#la)"/>
+  <defs><marker id="la" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#1B1B1F"/></marker></defs>
+</svg>
+            <div class="cap">Freeze distance, finish open-loop on odometry</div>
+          </div>
+        </div>
+        <div class="textcol">
+          <div class="titlebar"><h1>Phase 2: The “lunge”</h1><div class="rule"></div>
+            <div class="note" style="margin-top:8px">open-loop final approach</div></div>
+          <ul>
+            <li>Closer than ~0.90 m the base <span class="key">clips out of frame</span>.</li>
+            <li>Freeze distance, finish on <span class="key">odometry</span>.</li>
+            <li>Stop <span class="pill">0.03 m</span> short of 0.177 m engage.</li>
+            <li><span class="pill">PICKUP_CLOSE</span>: grab; hide cube from LiDAR.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">15 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== SLIDE 13 — DROP ON THE PLATE (16/21) ===================== -->
+<section>
+  <div class="frame">
+    <div class="blob qc-tr"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="split v55">
+        <div class="textcol">
+          <div class="titlebar"><h1>Phase 3: Drop on the plate</h1><div class="rule"></div></div>
+          <ul>
+            <li><span class="pill">GO_TO_PLATE</span>: Nav2 carries the cube near the plate.</li>
+            <li><span class="pill">DROP_ALIGN</span>: finish with <span class="key">cmd_vel</span> (0.25 m tol. too loose).</li>
+            <li><span class="pill">DROP_OPEN</span>: open gripper, re-show cube on plate.</li>
+            <li><span class="pill">DROP_BACKUP</span>: reverse <span class="key">0.25 m</span> before turning.</li>
+          </ul>
+        </div>
+        <div class="viscol">
+          <div class="card figwrap">
+            <svg class="fig-svg" viewBox="0 0 600 420">
+  <rect width="600" height="420" fill="#F4FAFB"/>
+  <rect x="0" y="300" width="600" height="120" fill="#EAF4F5"/>
+  <!-- green plate -->
+  <g transform="translate(430,320)">
+    <rect x="-60" y="-22" width="120" height="44" rx="6" fill="#3AAE5E" opacity=".3" stroke="#2E9E5B" stroke-width="2"/>
+    <text x="0" y="44" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="13" fill="#2E9E5B">plate centre</text>
+  </g>
+  <!-- robot carrying cube ~0.20m ahead -->
+  <g transform="translate(180,250)">
+    <rect x="-44" y="-30" width="88" height="60" rx="10" fill="#3A3A42"/>
+    <circle cx="-22" cy="34" r="14" fill="#26262C"/><circle cx="22" cy="34" r="14" fill="#26262C"/>
+    <!-- gripper closed holding cube ahead -->
+    <rect x="44" y="-6" width="60" height="12" rx="3" fill="#0E7C86"/>
+    <rect x="104" y="-16" width="26" height="28" rx="3" fill="#C42A8E"/>
+  </g>
+  <!-- ahead offset bracket -->
+  <line x1="180" y1="200" x2="310" y2="200" stroke="#6B6B73" stroke-width="1.5"/>
+  <line x1="180" y1="194" x2="180" y2="206" stroke="#6B6B73" stroke-width="1.5"/>
+  <line x1="310" y1="194" x2="310" y2="206" stroke="#6B6B73" stroke-width="1.5"/>
+  <text x="245" y="188" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="12" fill="#6B6B73">~0.20 m ahead</text>
+  <line x1="250" y1="250" x2="408" y2="300" stroke="#1B1B1F" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#da)"/>
+  <defs><marker id="da" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 z" fill="#1B1B1F"/></marker></defs>
+</svg>
+            <div class="cap">Cube carried ~0.20 m ahead; align on plate centre</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">16 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== SLIDE 14 — THE DOOR OPENS (17/21) ===================== -->
+<section>
+  <div class="frame">
+    <div class="blob qc-br"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="titlebar"><h1>The door opens</h1><div class="rule"></div>
+        <div class="note" style="margin-top:8px">door_controller</div></div>
+      <div style="display:grid;grid-template-columns:1fr 36%;gap:36px;align-items:center;height:calc(100% - 86px)">
+        <div class="card figwrap" style="align-self:center">
+          <svg class="fig-svg" viewBox="0 0 760 360">
+  <rect width="760" height="360" fill="#fff"/>
+  <!-- before -->
+  <g>
+    <rect x="30" y="40" width="320" height="280" rx="10" fill="#F4FAFB" stroke="#E6E6EA"/>
+    <text x="190" y="70" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="14" fill="#6B6B73">closed</text>
+    <rect x="150" y="110" width="14" height="150" fill="#2E6BD6"/>
+    <rect x="150" y="110" width="80" height="150" fill="#2E6BD6" opacity=".25"/>
+    <!-- plate empty -->
+    <rect x="240" y="250" width="70" height="34" rx="5" fill="#3AAE5E" opacity=".2" stroke="#2E9E5B"/>
+  </g>
+  <!-- arrow -->
+  <path d="M368,180 L398,180" stroke="#2E9E5B" stroke-width="3"/>
+  <path d="M392,172 L408,180 L392,188 Z" fill="#2E9E5B"/>
+  <!-- after -->
+  <g>
+    <rect x="410" y="40" width="320" height="280" rx="10" fill="#F4FAFB" stroke="#E6E6EA"/>
+    <text x="570" y="70" text-anchor="middle" font-family="JetBrains Mono,monospace" font-size="14" font-weight="600" fill="#2E9E5B">OPEN</text>
+    <!-- door swung -->
+    <rect x="530" y="110" width="14" height="150" fill="#2E6BD6" transform="rotate(38 537 110)"/>
+    <!-- cube on plate -->
+    <rect x="620" y="250" width="70" height="34" rx="5" fill="#3AAE5E" opacity=".35" stroke="#2E9E5B"/>
+    <rect x="642" y="232" width="24" height="24" rx="3" fill="#C42A8E"/>
+  </g>
+</svg>
+          <div class="cap">Cube on plate detected → door swings open</div>
+        </div>
+        <ul style="align-self:center">
+          <li>Separate node polls CoppeliaSim via <span class="pill">ZMQ</span>.</li>
+          <li>Detects the cube on the plate, then <span class="ok">opens the door</span>.</li>
+          <li>Mission completes at <span class="pill">DONE</span> — robot stays put.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">17 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== SLIDE 15 — DESIGN DECISIONS (18/21) ===================== -->
+<section>
+  <div class="frame">
+    <div class="blob qc-tl"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="titlebar"><h1>Design decisions — the “why”</h1><div class="rule"></div></div>
+      <div class="two-card" style="height:calc(100% - 96px);grid-template-rows:1fr 1fr">
+        <div class="card" style="padding:22px 26px;display:flex;flex-direction:column;justify-content:center">
+          <div class="pill" style="align-self:flex-start;margin-bottom:10px">frames</div>
+          <div style="font-size:21px;line-height:1.4"><span class="key">SLAM pose</span> for long-range goals (no drift); <span class="key">odometry</span> for short straight moves — lunge &amp; drop backup.</div>
+        </div>
+        <div class="card" style="padding:22px 26px;display:flex;flex-direction:column;justify-content:center">
+          <div class="pill" style="align-self:flex-start;margin-bottom:10px">stance</div>
+          <div style="font-size:21px;line-height:1.4"><span class="key">Perception-only</span>: ground-truth ZMQ lookups are a baseline to remove, not a design.</div>
+        </div>
+        <div class="card" style="padding:22px 26px;display:flex;flex-direction:column;justify-content:center">
+          <div class="pill" style="align-self:flex-start;margin-bottom:10px">mapping</div>
+          <div style="font-size:21px;line-height:1.4"><span class="key">Hide the carried cube</span> from the LiDAR — no phantom obstacle in the map.</div>
+        </div>
+        <div class="card" style="padding:22px 26px;display:flex;flex-direction:column;justify-content:center">
+          <div class="pill" style="align-self:flex-start;margin-bottom:10px">QoS</div>
+          <div style="font-size:21px;line-height:1.4"><span class="key">Latched</span> target topics — a late subscriber still gets the last pose.</div>
+        </div>
+      </div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">18 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== SLIDE 16 — RUNNING THE DEMO (19/21) ===================== -->
+<section>
+  <div class="frame">
+    <div class="blob qc-tr"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="split v55">
+        <div class="textcol">
+          <div class="titlebar"><h1>Running the demo</h1><div class="rule"></div></div>
+          <ul>
+            <li>All commands in the Pixi env: <span class="pill">pixi shell</span>.</li>
+            <li>One-shot launcher: <span class="pill">./run.sh</span> (defaults to easy.json).</li>
+            <li>Sim → build scene → colcon build → driver → door → SLAM + Nav2 + mission.</li>
+          </ul>
+        </div>
+        <div class="viscol">
+          <div class="card figwrap">
+            <div class="ph" style="aspect-ratio:16/9">
+  <div class="tag"><span class="lab">VIDEO / GIF</span><br>End-to-end demo — run.sh full mission<br><span style="opacity:.7">embed clip here</span></div>
+  <svg style="position:absolute;left:50%;top:46%;transform:translate(-50%,-50%)" width="68" height="68" viewBox="0 0 68 68">
+    <circle cx="34" cy="34" r="33" fill="#0E7C86" opacity=".92"/>
+    <path d="M27,22 L48,34 L27,46 Z" fill="#fff"/>
+  </svg>
+</div>
+            <div class="cap">End-to-end demo  ·  embed video / GIF</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">19 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== SLIDE 17 — LIMITATIONS & FUTURE WORK (20/21) ===================== -->
+<section>
+  <div class="frame">
+    <div class="blob qc-bl"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content">
+      <div class="titlebar"><h1>Limitations &amp; future work</h1><div class="rule"></div></div>
+      <ul style="margin-top:26px;font-size:26px">
+        <li>Some ground-truth shortcuts remain (ZMQ, attach/detach) → <span class="key">pure perception</span>.</li>
+        <li>Grasp robustness on the thin column is sensitive to the lunge margin.</li>
+        <li>Single key / single room → multiple keys &amp; connected rooms.</li>
+        <li>Only style lint today → add <span class="key">behavioural tests</span>.</li>
+      </ul>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">20 / 21</div>
+  </div>
+</section>
+
+<!-- ===================== SLIDE 18 — CONCLUSIONS (21/21) ===================== -->
+<section>
+  <div class="frame" style="padding:80px 88px 64px">
+    <div class="blob qc-br" style="width:480px;height:480px"></div>
+    <div class="usi"><div class="box"><span class="mark">USI</span></div></div>
+    <div class="content" style="display:flex;flex-direction:column;justify-content:center">
+      <div class="titlebar"><h1 style="font-size:50px">Conclusions</h1><div class="rule" style="width:96px"></div></div>
+      <ul style="margin-top:30px;font-size:28px">
+        <li>Complete pipeline: <span class="key">perception → SLAM → planning → manipulation</span>.</li>
+        <li>Works <span class="key">without any simulator coordinates</span> — the core goal.</li>
+        <li>Clean split: <span class="key">Nav2</span> to travel, <span class="pill">cmd_vel</span> to be precise, perception for “where”.</li>
+      </ul>
+      <div style="margin-top:40px;font-size:30px;font-weight:600;color:var(--accent)">Thanks — questions?</div>
+    </div>
+    <div class="talkfoot">Escape Room Robotics</div>
+    <div class="pageno">21 / 21</div>
+  </div>
+</section>
+
+</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.6.1/reveal.min.js"></script>
+<script>
+Reveal.initialize({
+  width:1280, height:720, margin:0,
+  minScale:0.2, maxScale:2.0,
+  hash:true, transition:'fade', transitionSpeed:'fast',
+  controls:true, progress:true, slideNumber:false
+});
+</script>
+</body>
+</html>
