@@ -32,7 +32,7 @@ Lugano, Switzerland}
 \maketitle
 
 \begin{abstract}
-This paper describes an autonomous robot system built for a
+This report describes an autonomous robot system built for a
 simulated escape-room task.
 A DJI RoboMaster~EP robot, running in CoppeliaSim, must explore
 an unknown room, find a coloured key cylinder, pick it up, and
@@ -47,10 +47,6 @@ visual servoing for the pickup.
 The robot completes the full task from start to finish.
 \end{abstract}
 
-\begin{IEEEkeywords}
-autonomous mobile robotics, ROS~2, Nav2, slam\_toolbox,
-visual servoing, frontier exploration, monocular depth
-\end{IEEEkeywords}
 
 % =====================================================================
 \section{Introduction}
@@ -76,7 +72,7 @@ We built three custom components on top of
 \texttt{slam\_toolbox} and Nav2:
 a lidar sensor, a colour detector, and a mission controller.
 
-The rest of the paper is structured as follows.
+The rest of this report is structured as follows.
 Section~\ref{sec:arch} explains the overall system.
 Sections~\ref{sec:perception}--\ref{sec:mission} describe each component.
 Section~\ref{sec:challenges} covers the problems we ran into and how
