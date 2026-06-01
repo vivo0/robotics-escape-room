@@ -27,11 +27,21 @@
         { pkgs, system }:
         {
           default = pkgs.mkShellNoCC {
-            packages = [
+            packages = with pkgs; [
+              # LaTeX Tooling
+              texlive.combined.scheme-full
+              texlab
+              tex-fmt
+              
+              # Formatter
               self.formatter.${system}
             ];
 
             shellHook = ''
+              # Guard clause: Prevent recursive execution loops inside the same shell instance
+              if [ -z "$_NIX_PIXI_SHELL_LOADED" ]; then
+                export _NIX_PIXI_SHELL_LOADED=1
+              
               # 1. Load Homebrew environment so Nix can see 'pixi'
               if [ -f /opt/homebrew/bin/brew ]; then
                 eval "$(/opt/homebrew/bin/brew shellenv)"
